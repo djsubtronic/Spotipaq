@@ -6,6 +6,8 @@ The application uses a .NET Framework 2.0 Windows Forms interface and a native 3
 
 **A Spotify Premium account is required for music playback.** Spotipaq is not affiliated with or endorsed by Spotify.
 
+![Spotipaq screenshot](screenshots/spotipaq.jpg)
+
 ## Functionality
 
 - Spotify account login and reusable local credentials.
@@ -117,7 +119,6 @@ Spotipaq stores user-specific state under `%APPDATA%\Spotipaq\`. Depending on th
 
 The artwork cache is designed to retain compressed images on disk while limiting decoded thumbnail caching in RAM to approximately 4 MB. Routine operations should not need to re-download artwork already cached from earlier playlist visits.
 
-Do not commit your local `%APPDATA%\Spotipaq\` data, logs, credentials or tokens to a public repository.
 
 ## Limitations
 
