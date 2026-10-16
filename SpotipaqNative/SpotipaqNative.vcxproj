@@ -1,4 +1,4 @@
-<?xml version="1.0" encoding="utf-8"?>
+﻿<?xml version="1.0" encoding="utf-8"?>
 <!--
   SpotipaqNative.dll - XP / Pentium II helper for Spotipaq (https via OpenSSL 1.0.2u, big-number maths; audio later).
   A "Makefile" project: Visual Studio edits and IntelliSenses spqnative.c, but Build / Rebuild /
@@ -34,7 +34,9 @@
   <ImportGroup Label="ExtensionSettings" />
   <PropertyGroup>
     <OpenSslXpDir Condition="'$(OPENSSL_XP)' != ''">$(OPENSSL_XP)</OpenSslXpDir>
-    <OpenSslXpDir Condition="'$(OpenSslXpDir)' == ''">$(USERPROFILE)\Desktop\Home\YouTubeNativePlayer_Prototype\openssl-1.0.2u-xp</OpenSslXpDir>
+    <!-- Optional local override. The .user file is Git-ignored and is never committed. -->
+    <OpenSslXpDir Condition="'$(OpenSslXpDir)' == '' and Exists('$(ProjectDir)openssl.local.user')">$([System.IO.File]::ReadAllText('$(ProjectDir)openssl.local.user').Trim().Replace('%USERPROFILE%', '$(USERPROFILE)'))</OpenSslXpDir>
+    <OpenSslXpDir Condition="'$(OpenSslXpDir)' == ''">$(ProjectDir)..\openssl-1.0.2u-xp</OpenSslXpDir>
     <NMakeBuildCommandLine>call "$(ProjectDir)build.cmd"</NMakeBuildCommandLine>
     <NMakeReBuildCommandLine>call "$(ProjectDir)build.cmd" clean &amp;&amp; call "$(ProjectDir)build.cmd"</NMakeReBuildCommandLine>
     <NMakeCleanCommandLine>call "$(ProjectDir)build.cmd" clean</NMakeCleanCommandLine>
@@ -46,15 +48,9 @@
   </PropertyGroup>
   <ItemGroup>
     <ClCompile Include="spqnative.c" />
-    <ClCompile Include="spq_audio.c" />
-    <ClCompile Include="spq_vorbis.c" />
   </ItemGroup>
   <ItemGroup>
     <None Include="build.cmd" />
-    <None Include="spq_vorbis_db.inc" />
-  </ItemGroup>
-  <ItemGroup>
-    <ClInclude Include="spq_vorbis.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets" />

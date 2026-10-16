@@ -19,7 +19,13 @@ rem ---- locate the XP OpenSSL build (static ssl.lib / crypto.lib) ----
 set "OSSL="
 if defined OPENSSL_XP if exist "%OPENSSL_XP%\include\openssl\ssl.h" set "OSSL=%OPENSSL_XP%"
 if not defined OSSL if exist "%ROOT%..\openssl-1.0.2u-xp\include\openssl\ssl.h" set "OSSL=%ROOT%..\openssl-1.0.2u-xp"
-if not defined OSSL if exist "%USERPROFILE%\Desktop\Home\YouTubeNativePlayer_Prototype\openssl-1.0.2u-xp\include\openssl\ssl.h" set "OSSL=%USERPROFILE%\Desktop\Home\YouTubeNativePlayer_Prototype\openssl-1.0.2u-xp"
+rem Local machine override (ignored by Git); use it only when no environment override was supplied.
+if not defined OSSL if not defined OPENSSL_XP if exist "%ROOT%openssl.local.user" (
+  rem Read the path and expand environment placeholders such as %%USERPROFILE%%.
+  rem A FOR variable is substituted before CALL's second expansion pass.
+  for /f "usebackq delims=" %%P in ("%ROOT%openssl.local.user") do call set "OSSL=%%P"
+  if defined OSSL call if not exist "%%OSSL%%\include\openssl\ssl.h" set "OSSL="
+)
 if not defined OSSL (
   echo SpotipaqNative : error : openssl-1.0.2u-xp not found. Set OPENSSL_XP to its folder.
   exit /b 1

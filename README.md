@@ -77,7 +77,7 @@ The included native build script targets the following environment:
 - Visual Studio/MSBuild support for .NET Framework 2.0 projects and the .NET 2.0 targeting assemblies.
 - NuGet dependencies restored for the managed project, including `Newtonsoft.Json` (see `Spotipaq/packages.config`).
 
-`SpotipaqNative/build.cmd` includes paths specific to the original development environment. You may need to adapt those paths to your Visual Studio installation. The script accepts `OPENSSL_XP` as the path to the OpenSSL build directory.
+`SpotipaqNative/build.cmd` uses `OPENSSL_XP` when set, otherwise it looks for `openssl-1.0.2u-xp` beside the `SpotipaqNative` directory. As a third option, place a plain-text file named `SpotipaqNative/openssl.local.user` containing the absolute path to your OpenSSL directory (one line only). Both the build script and the Visual Studio project recognise this local override. `*.user` files are excluded by the repository's `.gitignore`, so your personal OpenSSL location is not committed. The build script also expects the stated Visual Studio Build Tools installation and SDK; these paths may need adapting on other machines.
 
 ### Build steps
 
@@ -88,6 +88,8 @@ From a Windows command prompt in the repository root:
    ```bat
    set "OPENSSL_XP=C:\path\to\openssl-1.0.2u-xp"
    ```
+
+   Alternatively, place the OpenSSL folder beside `SpotipaqNative`, or create `SpotipaqNative/openssl.local.user` with its full path (without quotes). An `OPENSSL_XP` environment variable takes precedence over these fallbacks. If using the environment variable with Visual Studio, set it before launching Visual Studio.
 
 2. Build the native DLL:
 
