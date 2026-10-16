@@ -4,6 +4,9 @@ using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Text;
+using System.Drawing.Imaging;
+using System.IO;
+using System.Security.Cryptography;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
@@ -274,26 +277,35 @@ namespace Spotipaq
     }
 
     /// <summary>
-    /// Artwork cache. Images load on ONE background thread (the P2 shouldn't decode several JPEGs at once)
-    /// and are kept pre-scaled per size, so painting is a plain unscaled blit.
+    /// Asynchronous, disk-backed artwork cache. Only scaled 32-bit thumbnails are held
+    /// in memory (4 MiB). The compressed disk cache persists across runs (256 MiB).
+    /// Image decoding, scaling and file operations all run on one BelowNormal worker.
+    /// Get is called on the UI thread; Loaded is raised on that same thread.
     /// </summary>
     public sealed class ImageCache
     {
-        public event EventHandler Loaded;               // raised (on the UI thread) when any image arrives
+        public event EventHandler Loaded;
         readonly ISpotifyBackend _backend;
         readonly Control _ui;
         readonly Dictionary<string, Bitmap> _scaled = new Dictionary<string, Bitmap>();
-        readonly Dictionary<string, Bitmap> _originals = new Dictionary<string, Bitmap>();
+        readonly LinkedList<string> _lru = new LinkedList<string>();
+        readonly Dictionary<string, LinkedListNode<string>> _nodes = new Dictionary<string, LinkedListNode<string>>();
         readonly Dictionary<string, bool> _requested = new Dictionary<string, bool>();
-        readonly Queue<string> _queue = new Queue<string>();
+        readonly Queue<ArtRequest> _queue = new Queue<ArtRequest>();
         readonly object _lock = new object();
-        readonly List<string> _order = new List<string>();
-        const int MaxScaled = 400;
+        readonly string _folder;
+        const long MaxDiskBytes = 256L * 1024 * 1024;
+        const long MaxMemoryBytes = 4L * 1024 * 1024;
+        long _memoryBytes;
+        int _writesSinceTrim;
+
+        sealed class ArtRequest { public string Url; public int Width; public int Height; public string Key; }
 
         public ImageCache(ISpotifyBackend backend, Control ui)
         {
             _backend = backend;
             _ui = ui;
+            _folder = Path.Combine(Spotipaq.Engine.Log.Folder, "artcache");
             Thread t = new Thread(Worker);
             t.IsBackground = true;
             t.Priority = ThreadPriority.BelowNormal;
@@ -301,38 +313,79 @@ namespace Spotipaq
             t.Start();
         }
 
-        /// <summary>Returns the image at exactly w x h, or null (then queues the download).</summary>
+        /// <summary>Never accesses disk, decodes or scales on the UI thread.</summary>
         public Bitmap Get(string url, int w, int h)
         {
-            if (String.IsNullOrEmpty(url)) return null;
+            if (String.IsNullOrEmpty(url) || w <= 0 || h <= 0) return null;
             string key = url + "@" + w + "x" + h;
             Bitmap bmp;
-            if (_scaled.TryGetValue(key, out bmp)) return bmp;
-            Bitmap original;
-            lock (_lock) _originals.TryGetValue(url, out original);
-            if (original != null)
+            if (_scaled.TryGetValue(key, out bmp))
             {
-                bmp = Scale(original, w, h);
-                _scaled[key] = bmp;
-                _order.Add(key);
-                if (_order.Count > MaxScaled) { Bitmap old; if (_scaled.TryGetValue(_order[0], out old)) { _scaled.Remove(_order[0]); old.Dispose(); } _order.RemoveAt(0); }
+                LinkedListNode<string> node;
+                if (_nodes.TryGetValue(key, out node))
+                {
+                    _lru.Remove(node);
+                    _lru.AddLast(node);
+                }
                 return bmp;
             }
             lock (_lock)
             {
-                if (!_requested.ContainsKey(url)) { _requested[url] = true; _queue.Enqueue(url); Monitor.Pulse(_lock); }
+                if (!_requested.ContainsKey(key))
+                {
+                    _requested[key] = true;
+                    _queue.Enqueue(new ArtRequest { Url = url, Width = w, Height = h, Key = key });
+                    Monitor.Pulse(_lock);
+                }
             }
             return null;
         }
 
+        static long BitmapBytes(Bitmap bmp) { return (long)bmp.Width * bmp.Height * 4; }
+
+        // UI thread only. Never dispose a bitmap concurrently with its being painted.
+        void Publish(ArtRequest req, Bitmap bmp)
+        {
+            if (_ui.IsDisposed) { bmp.Dispose(); return; }
+            lock (_lock) _requested.Remove(req.Key);
+            if (_scaled.ContainsKey(req.Key)) { bmp.Dispose(); return; }
+            long size = BitmapBytes(bmp);
+            if (size > MaxMemoryBytes) { bmp.Dispose(); return; }
+            _scaled[req.Key] = bmp;
+            _nodes[req.Key] = _lru.AddLast(req.Key);
+            _memoryBytes += size;
+            while (_memoryBytes > MaxMemoryBytes && _lru.Count > 0)
+            {
+                string oldest = _lru.First.Value;
+                _lru.RemoveFirst();
+                _nodes.Remove(oldest);
+                Bitmap old = _scaled[oldest];
+                _scaled.Remove(oldest);
+                _memoryBytes -= BitmapBytes(old);
+                old.Dispose();
+            }
+            if (Loaded != null) Loaded(this, EventArgs.Empty);
+        }
+
+        static string FileName(string url)
+        {
+            byte[] data = Encoding.UTF8.GetBytes(url);
+            using (SHA256 sha = SHA256.Create())
+            {
+                byte[] hash = sha.ComputeHash(data);
+                StringBuilder hex = new StringBuilder(68);
+                for (int i = 0; i < hash.Length; i++) hex.Append(hash[i].ToString("x2"));
+                return hex.ToString() + ".jpg";
+            }
+        }
+
         static Bitmap Scale(Bitmap src, int w, int h)
         {
-            Bitmap dst = new Bitmap(w, h, System.Drawing.Imaging.PixelFormat.Format32bppPArgb);
+            Bitmap dst = new Bitmap(w, h, PixelFormat.Format32bppPArgb);
             using (Graphics g = Graphics.FromImage(dst))
             {
                 g.InterpolationMode = InterpolationMode.HighQualityBilinear;
                 g.PixelOffsetMode = PixelOffsetMode.HighQuality;
-                // centre-crop to the target aspect ratio
                 float sa = (float)src.Width / src.Height, da = (float)w / h;
                 RectangleF from = sa > da ? new RectangleF((src.Width - src.Height * da) / 2, 0, src.Height * da, src.Height)
                                           : new RectangleF(0, (src.Height - src.Width / da) / 2, src.Width, src.Width / da);
@@ -343,24 +396,98 @@ namespace Spotipaq
 
         void Worker()
         {
+            try { Directory.CreateDirectory(_folder); TrimDisk(); }
+            catch (Exception ex) { Spotipaq.Engine.Log.Write("Artwork cache init failed: " + ex.Message); }
             while (true)
             {
-                string url;
+                ArtRequest req;
                 lock (_lock)
                 {
                     while (_queue.Count == 0) Monitor.Wait(_lock);
-                    url = _queue.Dequeue();
+                    req = _queue.Dequeue();
                 }
-                Bitmap bmp = null;
-                try { bmp = _backend.LoadImage(url); } catch { }
-                if (bmp == null) continue;
-                lock (_lock) _originals[url] = bmp;
+                Bitmap result = null;
+                try
+                {
+                    string path = Path.Combine(_folder, FileName(req.Url));
+                    Bitmap original = null;
+                    if (File.Exists(path))
+                    {
+                        try
+                        {
+                            // Clone so the cached file is never locked while in use.
+                            using (Image cached = Image.FromFile(path)) original = new Bitmap(cached);
+                            // Touch at most daily to avoid a disk write on every cache hit.
+                            if ((DateTime.UtcNow - File.GetLastWriteTimeUtc(path)).TotalDays >= 1)
+                                File.SetLastWriteTimeUtc(path, DateTime.UtcNow);
+                        }
+                        catch
+                        {
+                            if (original != null) original.Dispose();
+                            original = null;
+                            try { File.Delete(path); } catch { }
+                        }
+                    }
+                    if (original == null)
+                    {
+                        original = _backend.LoadImage(req.Url);
+                        if (original != null)
+                        {
+                            try
+                            {
+                                // Write atomically; an interrupted run cannot poison the cache.
+                                string temp = path + ".tmp";
+                                original.Save(temp, ImageFormat.Jpeg);
+                                if (File.Exists(path)) File.Delete(temp);
+                                else File.Move(temp, path);
+                                if (++_writesSinceTrim >= 32) { _writesSinceTrim = 0; TrimDisk(); }
+                            }
+                            catch (Exception ex) { Spotipaq.Engine.Log.Write("Artwork cache write failed: " + ex.Message); }
+                        }
+                    }
+                    if (original != null)
+                    {
+                        using (original) result = Scale(original, req.Width, req.Height);
+                    }
+                }
+                catch (Exception ex) { Spotipaq.Engine.Log.Write("Artwork load failed: " + ex.Message); }
+
+                if (result == null)
+                {
+                    lock (_lock) _requested.Remove(req.Key);
+                    continue;
+                }
                 try
                 {
                     if (_ui.IsHandleCreated && !_ui.IsDisposed)
-                        _ui.BeginInvoke(new MethodInvoker(delegate () { if (Loaded != null) Loaded(this, EventArgs.Empty); }));
+                    {
+                        Bitmap ready = result;
+                        _ui.BeginInvoke(new MethodInvoker(delegate { Publish(req, ready); }));
+                        result = null;
+                    }
                 }
                 catch (InvalidOperationException) { }
+                if (result != null)
+                {
+                    result.Dispose();
+                    lock (_lock) _requested.Remove(req.Key);
+                }
+            }
+        }
+
+        // Worker thread only; startup and every 32 new cached images, not per frame.
+        void TrimDisk()
+        {
+            FileInfo[] files = new DirectoryInfo(_folder).GetFiles("*.jpg");
+            long total = 0;
+            foreach (FileInfo f in files) total += f.Length;
+            if (total <= MaxDiskBytes) return;
+            Array.Sort(files, delegate (FileInfo a, FileInfo b) { return a.LastWriteTimeUtc.CompareTo(b.LastWriteTimeUtc); });
+            foreach (FileInfo f in files)
+            {
+                if (total <= MaxDiskBytes) break;
+                try { long n = f.Length; f.Delete(); total -= n; }
+                catch { }
             }
         }
     }

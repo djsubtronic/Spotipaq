@@ -64,7 +64,6 @@ namespace Spotipaq.Engine
             StringBuilder err = new StringBuilder(512);
             int status, len;
             IntPtr pBody, pHeaders;
-            System.Diagnostics.Stopwatch sw = System.Diagnostics.Stopwatch.StartNew();
             int ok = spq_http(method, url, headers, body, body == null ? 0 : body.Length, out status, out pBody, out len, out pHeaders, err, err.Capacity);
             HttpResult r = new HttpResult();
             try
@@ -80,8 +79,8 @@ namespace Spotipaq.Engine
                 if (pBody != IntPtr.Zero) spq_free(pBody);
                 if (pHeaders != IntPtr.Zero) spq_free(pHeaders);
             }
-            if (Log.IsVerbose || r.Status >= 400 || sw.ElapsedMilliseconds > 3000)     // routine requests aren't logged
-                Log.Write("HTTP " + method + " " + Short(url) + " -> " + r.Status + " (" + r.Body.Length + " bytes, " + sw.ElapsedMilliseconds + " ms)" + Timing());
+            if (r.Status >= 400)
+                Log.Write("HTTP error " + r.Status + " " + method + " " + Short(url));
             return r;
         }
 
@@ -126,8 +125,24 @@ namespace Spotipaq.Engine
 
         public static void Debug(string line) { if (Verbose) Write(line); }
 
+        // Default log is error-only. Routine successes, slow-but-successful HTTP,
+        // and transient recovery milestones never open the log or touch the disk.
+        static bool IsError(string line)
+        {
+            if (String.IsNullOrEmpty(line)) return false;
+            string x = line.ToLowerInvariant();
+            if (x.StartsWith("cdn stream recovery") ||
+                x.StartsWith("playback recovery") ||
+                x.StartsWith("skipping failed track")) return false;
+            return x.IndexOf("failed") >= 0 || x.IndexOf("error") >= 0 ||
+                x.IndexOf("refused") >= 0 || x.IndexOf("unreadable") >= 0 ||
+                x.IndexOf("connection lost") >= 0 || x.IndexOf("wrong pins") >= 0 ||
+                x.IndexOf("out of date") >= 0;
+        }
+
         public static void Write(string line)
         {
+            if (!Verbose && !IsError(line)) return;
             try
             {
                 lock (Lock)

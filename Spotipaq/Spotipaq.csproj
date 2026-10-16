@@ -48,10 +48,10 @@
     <Compile Include="Engine\OAuthLogin.cs" />
     <Compile Include="Engine\Proto.cs" />
     <Compile Include="Engine\Shannon.cs" />
-	<Compile Include="Engine\Spclient.cs" />	  
+    <Compile Include="Engine\Spclient.cs" />
     <Compile Include="Engine\SpotifyBackend.cs" />
     <Compile Include="Engine\SpotifyEngine.cs" />
-	<Compile Include="Engine\SpotifyPlayback.cs" />
+    <Compile Include="Engine\SpotifyPlayback.cs" />
     <Compile Include="LoginForm.cs">
       <SubType>Form</SubType>
     </Compile>
@@ -73,7 +73,9 @@
   <ItemGroup>
     <Content Include="resources\spotipaq.ico" />
     <None Include="packages.config" />
-    <None Include="native\*.dll" />
+  </ItemGroup>
+  <ItemGroup>
+    <Folder Include="native\" />
   </ItemGroup>
   <PropertyGroup>
     <!-- Always run the copy step below, so a rebuilt SpotipaqNative.dll reaches bin\. -->

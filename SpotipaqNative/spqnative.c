@@ -23,12 +23,12 @@
 
 #define SPQ_API __declspec(dllexport)
 
-/* ------------------------------------------------------------------------------------------ init */
+ /* ------------------------------------------------------------------------------------------ init */
 static volatile LONG g_initState = 0;          /* 0 = not yet, 1 = in progress, 2 = done */
-static CRITICAL_SECTION *g_locks = NULL;
-static SSL_CTX *g_ctx = NULL;
+static CRITICAL_SECTION* g_locks = NULL;
+static SSL_CTX* g_ctx = NULL;
 
-static void locking_cb(int mode, int n, const char *file, int line)
+static void locking_cb(int mode, int n, const char* file, int line)
 {
     (void)file; (void)line;
     if (mode & CRYPTO_LOCK) EnterCriticalSection(&g_locks[n]);
@@ -46,7 +46,7 @@ static int spq_init(void)
         int i, n;
         WSAStartup(MAKEWORD(2, 2), &wsa);
         n = CRYPTO_num_locks();
-        g_locks = (CRITICAL_SECTION *)malloc(sizeof(CRITICAL_SECTION) * n);
+        g_locks = (CRITICAL_SECTION*)malloc(sizeof(CRITICAL_SECTION) * n);
         for (i = 0; i < n; i++) InitializeCriticalSection(&g_locks[i]);
         CRYPTO_set_id_callback(id_cb);
         CRYPTO_set_locking_callback(locking_cb);
@@ -69,16 +69,16 @@ static int spq_init(void)
 }
 
 /* -------------------------------------------------------------------------------------- helpers */
-typedef struct { unsigned char *p; int len, cap; } buf_t;
+typedef struct { unsigned char* p; int len, cap; } buf_t;
 
-static int buf_add(buf_t *b, const void *data, int n)
+static int buf_add(buf_t* b, const void* data, int n)
 {
     if (b->len + n + 1 > b->cap)
     {
         int cap = b->cap ? b->cap : 16384;
-        unsigned char *np;
+        unsigned char* np;
         while (cap < b->len + n + 1) cap *= 2;
-        np = (unsigned char *)realloc(b->p, cap);
+        np = (unsigned char*)realloc(b->p, cap);
         if (!np) return 0;
         b->p = np; b->cap = cap;
     }
@@ -88,14 +88,14 @@ static int buf_add(buf_t *b, const void *data, int n)
     return 1;
 }
 
-static void set_err(char *err, int errCap, const char *fmt, const char *arg)
+static void set_err(char* err, int errCap, const char* fmt, const char* arg)
 {
     if (!err || errCap <= 0) return;
     _snprintf(err, errCap - 1, fmt, arg ? arg : "");
     err[errCap - 1] = 0;
 }
 
-static void ssl_err(char *err, int errCap, const char *what)
+static void ssl_err(char* err, int errCap, const char* what)
 {
     char tmp[256];
     unsigned long e = ERR_get_error();
@@ -104,10 +104,10 @@ static void ssl_err(char *err, int errCap, const char *what)
 }
 
 /* case-insensitive search for a header line "name:" in the raw header block; returns pointer to value */
-static const char *find_header(const char *headers, const char *name)
+static const char* find_header(const char* headers, const char* name)
 {
     size_t n = strlen(name);
-    const char *p = headers;
+    const char* p = headers;
     while (p && *p)
     {
         if (_strnicmp(p, name, n) == 0 && p[n] == ':')
@@ -123,16 +123,16 @@ static const char *find_header(const char *headers, const char *name)
 }
 
 /* decode a chunked body in place; returns the new length or -1 */
-static int dechunk(unsigned char *data, int len)
+static int dechunk(unsigned char* data, int len)
 {
     int in = 0, out = 0;
     for (;;)
     {
         long size;
-        char *end;
+        char* end;
         if (in >= len) return -1;
-        size = strtol((const char *)data + in, &end, 16);
-        if ((unsigned char *)end == data + in) return -1;
+        size = strtol((const char*)data + in, &end, 16);
+        if ((unsigned char*)end == data + in) return -1;
         while (in < len && !(data[in] == '\r' && in + 1 < len && data[in + 1] == '\n')) in++;
         in += 2;
         if (size == 0) return out;
@@ -159,7 +159,7 @@ static char g_timing[160];
 static DWORD g_tick(void) { return GetTickCount(); }
 
 /* Connect with a short per-address timeout (XP waits ~21 s per dead address otherwise). */
-static int connect_timeout(SOCKET s, const struct sockaddr *a, int alen, int ms)
+static int connect_timeout(SOCKET s, const struct sockaddr* a, int alen, int ms)
 {
     u_long nb = 1, blk = 0;
     fd_set wf, ef;
@@ -178,26 +178,27 @@ static int connect_timeout(SOCKET s, const struct sockaddr *a, int alen, int ms)
     return 0;
 }
 
-SPQ_API void __cdecl spq_last_timing(char *buf, int cap)
+SPQ_API void __cdecl spq_last_timing(char* buf, int cap)
 {
     if (!buf || cap <= 0) return;
     _snprintf(buf, cap - 1, "%s", g_timing); buf[cap - 1] = 0;
 }
 
-SPQ_API int __cdecl spq_http(const char *method, const char *url, const char *headers,
-                             const unsigned char *body, int bodyLen,
-                             int *status, unsigned char **outBody, int *outLen, char **outHeaders,
-                             char *err, int errCap)
+SPQ_API int __cdecl spq_http(const char* method, const char* url, const char* headers,
+    const unsigned char* body, int bodyLen,
+    int* status, unsigned char** outBody, int* outLen, char** outHeaders,
+    char* err, int errCap)
 {
     char host[256], port[8], path[4096];
-    const char *p, *hostStart, *hostEnd, *pathStart;
+    const char* p, * hostStart, * hostEnd, * pathStart;
     int tls, ok = 0, n;
-    struct addrinfo hints, *res = NULL, *ai;
+    struct addrinfo hints, * res = NULL, * ai;
     SOCKET s = INVALID_SOCKET;
-    SSL *ssl = NULL;
+    SSL* ssl = NULL;
     buf_t req = { 0 }, resp = { 0 };
     char line[512];
     DWORD timeout = 30000;
+    int audioCdn = 0;
     DWORD t0 = g_tick(), tDns = 0, tConn = 0, tTls = 0;
     char ipstr[24] = "";
 
@@ -219,6 +220,13 @@ SPQ_API int __cdecl spq_http(const char *method, const char *url, const char *he
     if (hostEnd - hostStart >= (int)sizeof(host)) { set_err(err, errCap, "Host too long%s", NULL); return 0; }
     memcpy(host, hostStart, hostEnd - hostStart); host[hostEnd - hostStart] = 0;
     _snprintf(path, sizeof(path) - 1, "%s", *pathStart ? pathStart : "/"); path[sizeof(path) - 1] = 0;
+    /* A stalled CDN range must not starve the decoder for 30 seconds.
+       Keep the existing timeout for authentication, metadata and artwork. */
+    if (strstr(path, "/audio/") != NULL && strstr(host, ".scdn.co") != NULL)
+    {
+        audioCdn = 1;
+        timeout = 5000;
+    }
 
     /* ---- connect ---- */
     memset(&hints, 0, sizeof(hints));
@@ -230,11 +238,11 @@ SPQ_API int __cdecl spq_http(const char *method, const char *url, const char *he
     {
         s = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
         if (s == INVALID_SOCKET) continue;
-        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout, sizeof(timeout));
-        setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char *)&timeout, sizeof(timeout));
+        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
+        setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout, sizeof(timeout));
         if (connect_timeout(s, ai->ai_addr, (int)ai->ai_addrlen, 5000) == 0)
         {
-            _snprintf(ipstr, sizeof(ipstr) - 1, "%s", inet_ntoa(((struct sockaddr_in *)ai->ai_addr)->sin_addr));
+            _snprintf(ipstr, sizeof(ipstr) - 1, "%s", inet_ntoa(((struct sockaddr_in*)ai->ai_addr)->sin_addr));
             break;
         }
         closesocket(s); s = INVALID_SOCKET;
@@ -272,7 +280,7 @@ SPQ_API int __cdecl spq_http(const char *method, const char *url, const char *he
         int sent = 0;
         while (sent < req.len)
         {
-            n = tls ? SSL_write(ssl, req.p + sent, req.len - sent) : send(s, (const char *)req.p + sent, req.len - sent, 0);
+            n = tls ? SSL_write(ssl, req.p + sent, req.len - sent) : send(s, (const char*)req.p + sent, req.len - sent, 0);
             if (n <= 0) { ssl_err(err, errCap, "Send failed"); goto done; }
             sent += n;
         }
@@ -285,20 +293,32 @@ SPQ_API int __cdecl spq_http(const char *method, const char *url, const char *he
         {
             char chunk[16384];
             n = tls ? SSL_read(ssl, chunk, sizeof(chunk)) : recv(s, chunk, sizeof(chunk), 0);
-            if (n <= 0) break;
+            if (n <= 0)
+            {
+                if (audioCdn)
+                {
+                    int code = tls ? SSL_get_error(ssl, n) : 0;
+                    _snprintf(line, sizeof(line) - 1, "CDN receive interrupted (TLS=%d, socket=%d, received=%d bytes)",
+                        code, WSAGetLastError(), resp.len);
+                    line[sizeof(line) - 1] = 0;
+                    set_err(err, errCap, "%s", line);
+                    goto done;
+                }
+                break;
+            }
             if (!buf_add(&resp, chunk, n)) { set_err(err, errCap, "Out of memory%s", NULL); goto done; }
             if (!hdrDone)
             {
-                char *he = strstr((char *)resp.p, "\r\n\r\n");
+                char* he = strstr((char*)resp.p, "\r\n\r\n");
                 if (he)
                 {
-                    int hl = (int)(he - (char *)resp.p) + 2, st = 0;
+                    int hl = (int)(he - (char*)resp.p) + 2, st = 0;
                     char saved = (char)resp.p[hl];
-                    const char *te2, *cl2;
+                    const char* te2, * cl2;
                     resp.p[hl] = 0;
-                    sscanf((char *)resp.p, "HTTP/%*s %d", &st);
-                    te2 = find_header((char *)resp.p, "Transfer-Encoding");
-                    cl2 = find_header((char *)resp.p, "Content-Length");
+                    sscanf((char*)resp.p, "HTTP/%*s %d", &st);
+                    te2 = find_header((char*)resp.p, "Transfer-Encoding");
+                    cl2 = find_header((char*)resp.p, "Content-Length");
                     isChunked = te2 && _strnicmp(te2, "chunked", 7) == 0;
                     if (!isChunked && cl2) wantLen = atoi(cl2);
                     noBody = (st == 204 || st == 304 || (st >= 100 && st < 200));
@@ -319,16 +339,16 @@ SPQ_API int __cdecl spq_http(const char *method, const char *url, const char *he
     if (resp.len == 0) { ssl_err(err, errCap, "Empty response"); goto done; }
 
     {
-        char *hdrEnd = strstr((char *)resp.p, "\r\n\r\n");
+        char* hdrEnd = strstr((char*)resp.p, "\r\n\r\n");
         int headLen, bodyStart, blen;
-        const char *te, *cl;
+        const char* te, * cl;
         if (!hdrEnd) { set_err(err, errCap, "Malformed HTTP response%s", NULL); goto done; }
-        headLen = (int)(hdrEnd - (char *)resp.p) + 2;
+        headLen = (int)(hdrEnd - (char*)resp.p) + 2;
         bodyStart = headLen + 2;
-        if (status) sscanf((char *)resp.p, "HTTP/%*s %d", status);
+        if (status) sscanf((char*)resp.p, "HTTP/%*s %d", status);
         resp.p[headLen] = 0;                          /* terminate the header block (overwrites the 2nd CRLF) */
-        te = find_header((char *)resp.p, "Transfer-Encoding");
-        cl = find_header((char *)resp.p, "Content-Length");
+        te = find_header((char*)resp.p, "Transfer-Encoding");
+        cl = find_header((char*)resp.p, "Content-Length");
         blen = resp.len - bodyStart;
         if (te && _strnicmp(te, "chunked", 7) == 0)
         {
@@ -342,12 +362,12 @@ SPQ_API int __cdecl spq_http(const char *method, const char *url, const char *he
         }
         if (outHeaders)
         {
-            *outHeaders = (char *)malloc(headLen + 1);
+            *outHeaders = (char*)malloc(headLen + 1);
             if (*outHeaders) { memcpy(*outHeaders, resp.p, headLen); (*outHeaders)[headLen] = 0; }
         }
         if (outBody)
         {
-            *outBody = (unsigned char *)malloc(blen + 1);
+            *outBody = (unsigned char*)malloc(blen + 1);
             if (!*outBody) { set_err(err, errCap, "Out of memory%s", NULL); goto done; }
             memcpy(*outBody, resp.p + bodyStart, blen);
             (*outBody)[blen] = 0;
@@ -366,15 +386,15 @@ done:
     return ok;
 }
 
-SPQ_API void __cdecl spq_free(void *p) { free(p); }
+SPQ_API void __cdecl spq_free(void* p) { free(p); }
 
 /* ------------------------------------------------------------------------------------- spq_modexp */
 /* result = base^exp mod m, big-endian unsigned byte arrays. Returns result length, or -1. */
-SPQ_API int __cdecl spq_modexp(const unsigned char *base, int baseLen, const unsigned char *exp, int expLen,
-                               const unsigned char *mod, int modLen, unsigned char *out, int outCap)
+SPQ_API int __cdecl spq_modexp(const unsigned char* base, int baseLen, const unsigned char* exp, int expLen,
+    const unsigned char* mod, int modLen, unsigned char* out, int outCap)
 {
-    BN_CTX *ctx;
-    BIGNUM *b, *e, *m, *r;
+    BN_CTX* ctx;
+    BIGNUM* b, * e, * m, * r;
     int len = -1;
     if (!spq_init()) return -1;
     ctx = BN_CTX_new();

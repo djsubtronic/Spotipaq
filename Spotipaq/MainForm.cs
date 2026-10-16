@@ -90,9 +90,9 @@ namespace Spotipaq
             {
                 SafeUi(delegate
                 {
-                    // Only skip on from songs we moved to by ourselves; a song you clicked on yourself shows its error instead.
-                    if (!_auto || ++_skipStreak > Math.Min(25, Math.Max(1, _queue.Count))) { _skipStreak = 0; return; }
-                    Engine.Log.Write("Skipping unplayable track");
+                    // Never leave an active playlist stranded after a terminal load/stream failure.
+                    if (_queue.Count == 0 || ++_skipStreak > Math.Min(25, Math.Max(1, _queue.Count))) { _skipStreak = 0; return; }
+                    Engine.Log.Write("Skipping failed track");
                     Skip(1, false);
                 });
             };

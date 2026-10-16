@@ -82,6 +82,8 @@ namespace Spotipaq.Engine
         Track _current;
         int _gen, _volume = 80, _startMs, _seekMs, _seekTick;
         bool _endFired;
+        int _loadStartedTick, _loadRetry;
+        const int LoadLimitMs = 45000;
         public string LastError;
 
         public SpotifyPlayback(SpotifyEngine engine, Spclient sp)
@@ -121,6 +123,7 @@ namespace Spotipaq.Engine
                 try { Native.AudioStop(); } catch { }
             }
             _current = track; _startMs = startMs; _seekTick = 0; _endFired = false; LastError = null;
+            _loadRetry = 0; _loadStartedTick = Environment.TickCount;
             Set(PlayState.Loading);
             ThreadPool.QueueUserWorkItem(delegate { Load(track, startMs, gen); });
         }
@@ -163,6 +166,30 @@ namespace Spotipaq.Engine
         {
             try
             {
+                if (_state == PlayState.Loading && !_endFired)
+                {
+                    if (unchecked((uint)(Environment.TickCount - _loadStartedTick)) > LoadLimitMs)
+                    {
+                        if (_loadRetry == 0)
+                        {
+                            _loadRetry = 1;
+                            int gen;
+                            lock (_audioLock) { gen = ++_gen; try { Native.AudioStop(); } catch { } }
+                            _loadStartedTick = Environment.TickCount;
+                            Log.Write("Playback recovery: track load exceeded 45s; retrying " + (_current == null ? "" : _current.Name));
+                            Track track = _current; int at = _startMs;
+                            ThreadPool.QueueUserWorkItem(delegate { Load(track, at, gen); });
+                        }
+                        else
+                        {
+                            lock (_audioLock) { ++_gen; try { Native.AudioStop(); } catch { } }
+                            _endFired = true;
+                            Fail("Track load exceeded 45s twice");
+                            Fire(TrackUnplayable);
+                        }
+                    }
+                    return;
+                }
                 if (_state != PlayState.Playing || _endFired) return;
                 int st = Native.AudioState();
                 if (st == 4)
@@ -176,6 +203,7 @@ namespace Spotipaq.Engine
                 {
                     _endFired = true;
                     Fail("The audio decoder reported an error");
+                    Fire(TrackUnplayable);
                 }
             }
             catch { }
@@ -273,21 +301,29 @@ namespace Spotipaq.Engine
             return list;
         }
 
-        HttpResult GetRange(string url, int from, int to)
+        // Retry transient CDN failures without duplicating or losing an audio byte.
+        // Routine successful downloads are not logged here.
+        HttpResult GetRange(string url, int from, int to, int gen)
         {
             Exception last = null;
-            for (int attempt = 0; attempt < 3; attempt++)
+            for (int attempt = 1; attempt <= 3; attempt++)
             {
+                if (gen != _gen) return null;
                 try
                 {
                     HttpResult r = Native.Http("GET", url, "Range: bytes=" + from + "-" + to + "\r\n", null);
-                    if (r.Status == 206 || r.Status == 200) return r;
-                    last = new IOException("CDN returned HTTP " + r.Status);
+                    int wanted = to - from + 1;
+                    if (r.Status == 206 && r.Body != null && r.Body.Length == wanted) return r;
+                    // A full-file 200 response is valid only for the initial request.
+                    if (r.Status == 200 && from == 0 && r.Body != null && r.Body.Length > 0) return r;
+                    last = new IOException("CDN response HTTP " + r.Status + ", bytes " +
+                        (r.Body == null ? 0 : r.Body.Length) + "/" + wanted);
                 }
                 catch (Exception ex) { last = ex; }
-                Thread.Sleep(400);
+                if (gen != _gen) return null;
+                if (attempt < 3) Thread.Sleep(300 * attempt);
             }
-            throw last;
+            throw new IOException("CDN range " + from + "-" + to + " failed after 3 attempts", last);
         }
 
         void Load(Track track, int startMs, int gen)
@@ -305,7 +341,6 @@ namespace Spotipaq.Engine
                 try { Dictionary<string, byte[]> am = _sp.ExtMeta(5, new string[] { uri }, false); am.TryGetValue(uri, out af); }
                 catch (Exception ex) { Log.Write("Audio files lookup: " + ex.Message); }
                 List<Candidate> cands = Candidates(tm, af);
-                Log.Write("Track metadata " + tm.Length + " bytes, audio-files ext " + (af == null ? "none" : af.Length + " bytes") + ", " + cands.Count + " candidate files");
                 if (cands.Count == 0) throw new UnplayableException("This track isn't available to play in your country");
                 if (gen != _gen) return;
 
@@ -313,8 +348,8 @@ namespace Spotipaq.Engine
                 for (int i = 0; i < cands.Count && i < 8 && key == null; i++)
                 {
                     if (gen != _gen) return;
-                    try { key = _keys.Get(ap, cands[i].FileId, cands[i].Gid, 1); fileId = cands[i].FileId; Log.Write("Audio key OK for " + cands[i]); }
-                    catch (InvalidOperationException) { Log.Write("Audio key refused for " + cands[i]); }
+                    try { key = _keys.Get(ap, cands[i].FileId, cands[i].Gid, 1); fileId = cands[i].FileId; }
+                    catch (InvalidOperationException) { }
                 }
                 if (key == null)
                 {
@@ -332,7 +367,8 @@ namespace Spotipaq.Engine
                     throw new UnplayableException("Spotify didn't offer a download for this track");
                 string url = sd[2][0].Text;
 
-                HttpResult first = GetRange(url, 0, 131071);
+                HttpResult first = GetRange(url, 0, 131071, gen);
+                if (first == null) return;
                 int total, offset;
                 if (first.Status == 200) total = first.Body.Length;
                 else
@@ -350,16 +386,62 @@ namespace Spotipaq.Engine
                     if (!Native.AudioPlay(startMs)) throw new InvalidOperationException("Couldn't start the audio engine");
                 }
                 offset = first.Body.Length;
-                Log.Write("Playing " + track.Name + " (" + total + " bytes)");
                 if (gen == _gen) Set(PlayState.Playing);
 
                 while (offset < total)
                 {
                     if (gen != _gen) return;
                     int end = Math.Min(total - 1, offset + 524288 - 1);
-                    HttpResult r = GetRange(url, offset, end);
-                    if (r.Body.Length == 0) throw new IOException("Empty chunk from the CDN");
-                    lock (_audioLock) { if (gen != _gen) return; Native.AudioFeed(r.Body); }
+                    // A failed future range is not a decoder failure. Keep the already-decoded
+                    // audio playing and retry this same range, without resetting the native
+                    // session or advancing the byte offset until a complete range arrives.
+                    HttpResult r = null;
+                    int recoveryStart = 0;
+                    int recoveryCycles = 0;
+                    Exception recoveryError = null;
+                    while (r == null)
+                    {
+                        if (gen != _gen) return;
+                        try
+                        {
+                            r = GetRange(url, offset, end, gen);
+                            if (r == null) return;
+                        }
+                        catch (IOException ex)
+                        {
+                            if (gen != _gen) return;
+                            recoveryError = ex;
+                            if (recoveryCycles++ == 0)
+                            {
+                                recoveryStart = Environment.TickCount;
+                                Log.Write("CDN stream recovery started: " + track.Name +
+                                    ", range " + offset + "-" + end + ", " + ex.Message);
+                            }
+                            // Retain the existing decoded audio and allow the CDN to recover.
+                            // Cap the window so a permanently unavailable final range cannot
+                            // strand a playlist indefinitely. Tick/Next can supersede this load.
+                            int elapsed = unchecked(Environment.TickCount - recoveryStart);
+                            if (elapsed < 0) elapsed = Int32.MaxValue;
+                            if (elapsed >= 60000)
+                            {
+                                Log.Write("CDN stream recovery exhausted: " + track.Name +
+                                    ", range " + offset + "-" + end + ", " +
+                                    elapsed + "ms, " + recoveryCycles + " cycles; " + recoveryError.Message);
+                                throw new IOException("Audio stream unavailable after recovery", recoveryError);
+                            }
+                            Thread.Sleep(500);
+                        }
+                    }
+                    if (gen != _gen) return;
+                    if (recoveryCycles > 0)
+                        Log.Write("CDN stream recovered: " + track.Name + ", range " + offset +
+                            "-" + end + " after " + recoveryCycles + " failed cycles");
+                    lock (_audioLock)
+                    {
+                        if (gen != _gen) return;
+                        if (Native.AudioFeed(r.Body) != r.Body.Length)
+                            throw new IOException("Native decoder rejected downloaded audio bytes");
+                    }
                     offset += r.Body.Length;
                 }
             }
@@ -367,8 +449,20 @@ namespace Spotipaq.Engine
             {
                 if (gen != _gen) return;
                 Log.Write("Load failed: " + ex);
+                bool loading = _state == PlayState.Loading;
+                if (loading && !(ex is UnplayableException) && _loadRetry == 0)
+                {
+                    _loadRetry = 1;
+                    int retryGen;
+                    lock (_audioLock) { retryGen = ++_gen; try { Native.AudioStop(); } catch { } }
+                    _loadStartedTick = Environment.TickCount;
+                    Log.Write("Playback recovery: retrying track once after load failure: " + ex.Message);
+                    ThreadPool.QueueUserWorkItem(delegate { Load(track, startMs, retryGen); });
+                    return;
+                }
+                _endFired = true;
                 Fail(ex.Message);
-                if (ex is UnplayableException) Fire(TrackUnplayable);
+                Fire(TrackUnplayable);
             }
         }
     }
