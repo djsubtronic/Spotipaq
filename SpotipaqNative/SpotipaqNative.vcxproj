@@ -46,9 +46,15 @@
   </PropertyGroup>
   <ItemGroup>
     <ClCompile Include="spqnative.c" />
+    <ClCompile Include="spq_audio.c" />
+    <ClCompile Include="spq_vorbis.c" />
   </ItemGroup>
   <ItemGroup>
     <None Include="build.cmd" />
+    <None Include="spq_vorbis_db.inc" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="spq_vorbis.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets" />
