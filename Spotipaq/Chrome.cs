@@ -36,6 +36,25 @@ namespace Spotipaq
         int _hot = -1, _scroll;
         const int ItemH = 30, HeadH = 34;
 
+        // custom scrollbar: same look and behaviour as the main page's, darkened by the sidebar/main background ratio (18/24 = 0.75)
+        const int BarW = 8;
+        bool _dragThumb;
+        int _dragOffset;
+        static readonly Color BarTrack = Color.FromArgb(23, 23, 23);        // main: 30
+        static readonly Color BarThumb = Color.FromArgb(68, 68, 68);        // main: 90
+        static readonly Color BarThumbDrag = Color.FromArgb(113, 113, 113); // main: 150
+        int MaxScroll { get { return Math.Max(0, ContentHeight - Height); } }
+        void ClampScroll() { _scroll = Math.Max(0, Math.Min(_scroll, MaxScroll)); }
+        int ViewW { get { return Width - BarW; } }          // width available to the items (the bar's strip is always reserved, like the main page)
+
+        Rectangle Thumb()
+        {
+            int h = Height;
+            int th = Math.Max(30, (int)((long)h * h / Math.Max(1, ContentHeight)));
+            int ty = MaxScroll == 0 ? 0 : (int)((long)(h - th) * _scroll / MaxScroll);
+            return new Rectangle(Width - BarW + 1, ty, BarW - 2, th);
+        }
+
         public Sidebar()
         {
             SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
@@ -79,8 +98,11 @@ namespace Spotipaq
             if (playlists != null)
                 foreach (Playlist p in playlists)
                     _items.Add(new SidebarItem(p.Name + (p.Owner == "Spotify" ? "  by Spotify" : ""), new NavTarget(PageKind.Playlist, p.Id), false, 'P'));
+            ClampScroll();
             Invalidate();
         }
+
+        protected override void OnResize(EventArgs e) { base.OnResize(e); ClampScroll(); }
 
         public void SetCurrent(NavTarget t) { _current = t; Invalidate(); }
 
@@ -101,27 +123,32 @@ namespace Spotipaq
                 if (it.IsHeader)
                 {
                     bool hotHead = it.Collapsible && i == _hotHeader;
-                    Theme.Text1(g, it.Text, Theme.Label, new Rectangle(16, y + 14, Width - 24, 18), hotHead ? Theme.SubText : Theme.DimText);
+                    Theme.Text1(g, it.Text, Theme.Label, new Rectangle(16, y + 14, ViewW - 24, 18), hotHead ? Theme.SubText : Theme.DimText);
                     if (it.Collapsible)
                     {
-                        int cx = Width - 22, cy = y + 23;
+                        int cx = ViewW - 22, cy = y + 23;
                         using (SolidBrush cb = new SolidBrush(hotHead ? Theme.SubText : Theme.DimText))
                             g.FillPolygon(cb, LibraryCollapsed ? new Point[] { new Point(cx, cy - 4), new Point(cx + 4, cy), new Point(cx, cy + 4) }
                                                                : new Point[] { new Point(cx - 3, cy - 2), new Point(cx + 5, cy - 2), new Point(cx + 1, cy + 3) });
                     }
                     continue;
                 }
-                if (_dragging && i == _press) using (SolidBrush b = new SolidBrush(Theme.RowHover)) g.FillRectangle(b, 0, y, Width - 1, h);
+                if (_dragging && i == _press) using (SolidBrush b = new SolidBrush(Theme.RowHover)) g.FillRectangle(b, 0, y, ViewW, h);
                 bool current = _current != null && it.Target.Kind == _current.Kind && it.Target.Id == _current.Id;
                 if (current) using (SolidBrush b = new SolidBrush(Theme.Accent)) g.FillRectangle(b, 0, y + 4, 4, h - 8);
                 Color c = current || i == _hot ? Theme.Text : Theme.SubText;
                 DrawIcon(g, it.Icon, new Rectangle(16, y + 7, 16, 16), c);
-                Theme.Text1(g, it.Text, Theme.Normal, new Rectangle(40, y, Width - 48, h), c);
+                Theme.Text1(g, it.Text, Theme.Normal, new Rectangle(40, y, ViewW - 48, h), c);
             }
             if (_dragging && _drop >= 0)
             {
                 int ly = ItemTop(_drop);
-                using (SolidBrush b = new SolidBrush(Theme.Accent)) g.FillRectangle(b, 8, ly - 1, Width - 20, 2);
+                using (SolidBrush b = new SolidBrush(Theme.Accent)) g.FillRectangle(b, 8, ly - 1, ViewW - 20, 2);
+            }
+            if (MaxScroll > 0)
+            {
+                using (SolidBrush track = new SolidBrush(BarTrack)) g.FillRectangle(track, Width - BarW, 0, BarW, Height);
+                using (SolidBrush tb = new SolidBrush(_dragThumb ? BarThumbDrag : BarThumb)) g.FillRectangle(tb, Thumb());
             }
             using (Pen p = new Pen(Color.FromArgb(44, 44, 44))) g.DrawLine(p, Width - 1, 0, Width - 1, Height);
         }
@@ -154,6 +181,13 @@ namespace Spotipaq
         {
             base.OnMouseDown(e);
             if (e.Button != MouseButtons.Left) return;
+            if (MaxScroll > 0 && e.X >= Width - BarW)
+            {
+                Rectangle t = Thumb();
+                if (t.Contains(e.Location)) { _dragThumb = true; _dragOffset = e.Y - t.Top; Capture = true; }
+                else { _scroll += e.Y < t.Top ? -Height : Height; ClampScroll(); Invalidate(); }
+                return;
+            }
             int i = ItemAt(e.Y);
             _press = IsPlaylistItem(i) ? i : -1;
             _downPt = e.Location;
@@ -162,6 +196,21 @@ namespace Spotipaq
 
         protected override void OnMouseMove(MouseEventArgs e)
         {
+            if (_dragThumb)
+            {
+                int viewH = Height, th = Thumb().Height;
+                _scroll = (int)((long)(e.Y - _dragOffset) * MaxScroll / Math.Max(1, viewH - th));
+                ClampScroll();
+                Invalidate();
+                return;
+            }
+            if (MaxScroll > 0 && e.X >= Width - BarW && _press < 0)
+            {
+                if (_hot != -1 || _hotHeader != -1) { _hot = -1; _hotHeader = -1; Invalidate(); }
+                Cursor = Cursors.Default;
+                base.OnMouseMove(e);
+                return;
+            }
             if (_press >= 0 && (e.Button & MouseButtons.Left) != 0)
             {
                 if (!_dragging && Math.Abs(e.Y - _downPt.Y) > 6) { _dragging = true; Capture = true; _autoScroll.Start(); }
@@ -183,6 +232,7 @@ namespace Spotipaq
 
         protected override void OnMouseUp(MouseEventArgs e)
         {
+            if (_dragThumb) { _dragThumb = false; Capture = false; Invalidate(); base.OnMouseUp(e); return; }
             bool wasDrag = _dragging;
             int press = _press, slot = _drop;
             _press = -1; _drop = -1; _dragging = false; Capture = false; _autoScroll.Stop();

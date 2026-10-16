@@ -63,7 +63,7 @@ namespace Spotipaq
             _images = new ImageCache(backend, this);
             _page = new PageView(this);
 
-            _sidebar.Width = 210; _sidebar.Dock = DockStyle.Left;
+            _sidebar.Width = 218; _sidebar.Dock = DockStyle.Left;
             _top.Dock = DockStyle.Top;
             _bar.Dock = DockStyle.Bottom;
             _page.Dock = DockStyle.Fill;
