@@ -123,7 +123,7 @@ namespace Spotipaq
                 int ly = ItemTop(_drop);
                 using (SolidBrush b = new SolidBrush(Theme.Accent)) g.FillRectangle(b, 8, ly - 1, Width - 20, 2);
             }
-            using (Pen p = new Pen(Color.FromArgb(10, 10, 10))) g.DrawLine(p, Width - 1, 0, Width - 1, Height);
+            using (Pen p = new Pen(Color.FromArgb(44, 44, 44))) g.DrawLine(p, Width - 1, 0, Width - 1, Height);
         }
 
         // Tiny vector icons so nothing depends on fonts/images that XP may not have.
@@ -349,7 +349,8 @@ namespace Spotipaq
         public event EventHandler VolumeChanged;
 
         public Track Track;
-        public bool Playing, Shuffle, Repeat;
+        public bool Playing, Shuffle;
+        public int RepeatMode;      // 0 off, 1 repeat all, 2 repeat one
         public int PositionMs;
         public int Volume = 80;
         public bool DraggingVolume { get { return _dragVol; } }
@@ -403,7 +404,7 @@ namespace Spotipaq
             SkipGlyph(g, PrevRect, false, _hot == "prev" ? Color.White : idle);
             SkipGlyph(g, NextRect, true, _hot == "next" ? Color.White : idle);
             ShuffleGlyph(g, ShuffleRect, Shuffle ? Theme.Accent : _hot == "shuffle" ? Color.White : idle);
-            RepeatGlyph(g, RepeatRect, Repeat ? Theme.Accent : _hot == "repeat" ? Color.White : idle);
+            RepeatGlyph(g, RepeatRect, RepeatMode, RepeatMode != 0 ? Theme.Accent : _hot == "repeat" ? Color.White : idle);
             g.SmoothingMode = SmoothingMode.None;
 
             // seek bar + times
@@ -454,21 +455,54 @@ namespace Spotipaq
                 else { g.FillPolygon(b, new Point[] { new Point(cx + 6, cy - 7), new Point(cx - 4, cy), new Point(cx + 6, cy + 7) }); g.FillRectangle(b, cx - 6, cy - 7, 2, 14); }
             }
         }
+        static void ArrowHead(Graphics g, Pen p, int x, int y, int dx, int dy)
+        {
+            g.DrawLine(p, x - dx - dy, y - dy + dx, x, y);
+            g.DrawLine(p, x - dx + dy, y - dy - dx, x, y);
+        }
         static void ShuffleGlyph(Graphics g, Rectangle r, Color c)
         {
-            using (Pen p = new Pen(c, 1.5f))
+            using (Pen p = new Pen(c, 1.7f))
             {
-                g.DrawLine(p, r.Left + 3, r.Top + 7, r.Left + 20, r.Top + 17);
-                g.DrawLine(p, r.Left + 3, r.Top + 17, r.Left + 20, r.Top + 7);
-                g.DrawLine(p, r.Left + 16, r.Top + 5, r.Left + 20, r.Top + 7); g.DrawLine(p, r.Left + 16, r.Top + 19, r.Left + 20, r.Top + 17);
+                p.StartCap = LineCap.Round; p.EndCap = LineCap.Round;
+
+                // upper path: left -> right/down
+                g.DrawLine(p, r.Left + 4, r.Top + 8, r.Left + 10, r.Top + 8);
+                g.DrawLine(p, r.Left + 10, r.Top + 8, r.Left + 18, r.Top + 16);
+                ArrowHead(g, p, r.Left + 19, r.Top + 16, 3, 0);
+
+                // lower path: left -> right/up
+                g.DrawLine(p, r.Left + 4, r.Top + 16, r.Left + 10, r.Top + 16);
+                g.DrawLine(p, r.Left + 10, r.Top + 16, r.Left + 18, r.Top + 8);
+                ArrowHead(g, p, r.Left + 19, r.Top + 8, 3, 0);
             }
         }
-        static void RepeatGlyph(Graphics g, Rectangle r, Color c)
+        static void RepeatGlyph(Graphics g, Rectangle r, int mode, Color c)
         {
-            using (Pen p = new Pen(c, 1.5f))
+            // Compact repeat arrows, visually balanced with the shuffle glyph.
+            using (Pen p = new Pen(c, 1.7f))
             {
-                g.DrawRectangle(p, r.Left + 3, r.Top + 7, 17, 10);
-                g.DrawLine(p, r.Left + 14, r.Top + 4, r.Left + 17, r.Top + 7); g.DrawLine(p, r.Left + 14, r.Top + 10, r.Left + 17, r.Top + 7);
+                p.StartCap = LineCap.Round; p.EndCap = LineCap.Round;
+
+                // Upper run points right.
+                g.DrawLine(p, r.Left + 5, r.Top + 7, r.Left + 19, r.Top + 7);
+                g.DrawLine(p, r.Left + 5, r.Top + 7, r.Left + 5, r.Top + 10);
+                ArrowHead(g, p, r.Left + 20, r.Top + 7, 3, 0);
+
+                // Lower run points left.
+                g.DrawLine(p, r.Left + 19, r.Top + 17, r.Left + 5, r.Top + 17);
+                g.DrawLine(p, r.Left + 19, r.Top + 17, r.Left + 19, r.Top + 14);
+                ArrowHead(g, p, r.Left + 4, r.Top + 17, -3, 0);
+            }
+            if (mode == 2)
+            {
+                // Small, simple vector 1 centred between the two runs; no foot.
+                using (Pen one = new Pen(c, 1.25f))
+                {
+                    one.StartCap = LineCap.Round; one.EndCap = LineCap.Round;
+                    g.DrawLine(one, r.Left + 11, r.Top + 12, r.Left + 12, r.Top + 11);
+                    g.DrawLine(one, r.Left + 12, r.Top + 11, r.Left + 12, r.Top + 14);
+                }
             }
         }
         static void SpeakerGlyph(Graphics g, Rectangle r, Color c)

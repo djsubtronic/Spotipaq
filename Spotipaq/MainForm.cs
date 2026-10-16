@@ -26,7 +26,9 @@ namespace Spotipaq
         List<Track> _queue = new List<Track>();
         List<int> _order = new List<int>();     // play order (shuffled or 0..n-1)
         int _orderPos = -1;
-        bool _shuffle, _repeat;
+        const int RepeatOff = 0, RepeatAll = 1, RepeatOne = 2;
+        bool _shuffle;
+        int _repeatMode;
         readonly Random _rng = new Random();
 
         // saved between runs
@@ -52,7 +54,9 @@ namespace Spotipaq
             try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
             RestoreWindow();
             _shuffle = _settings.GetBool("shuffle", false);
-            _repeat = _settings.GetBool("repeat", false);
+            int savedRepeat = _settings.GetInt("repeatMode", -1);
+            _repeatMode = savedRepeat >= 0 ? Math.Max(RepeatOff, Math.Min(RepeatOne, savedRepeat))
+                                          : (_settings.GetBool("repeat", false) ? RepeatAll : RepeatOff);
             _player.Volume = Math.Max(0, Math.Min(100, _settings.GetInt("volume", 80)));
             int pos; _restored = _settings.GetTrack(out pos); _restoredPos = pos;
 
@@ -80,12 +84,25 @@ namespace Spotipaq
             _bar.Next += delegate { Skip(1, true); };
             _bar.Previous += delegate { Previous(); };
             _bar.ShuffleToggled += delegate { SetShuffle(!_shuffle); };
-            _bar.RepeatToggled += delegate { _repeat = !_repeat; RefreshBar(); SaveSettings(false); };
+            _bar.RepeatToggled += delegate { _repeatMode = (_repeatMode + 1) % 3; RefreshBar(); SaveSettings(false); };
             _bar.SeekRequested += delegate (object s, SeekEventArgs e) { if (_player.Current != null) _player.Seek(e.Ms); RefreshBar(); };
             _bar.LinkClicked += delegate (object s, NavEventArgs e) { Navigate(e.Target); };
             _bar.VolumeChanged += delegate { _player.Volume = _bar.Volume; _volumeDirty = true; };
             _player.StateChanged += delegate { SafeUi(RefreshAll); };
-            _player.TrackEnded += delegate { SafeUi(delegate { _skipStreak = 0; Skip(1, false); }); };
+            _player.TrackEnded += delegate
+            {
+                SafeUi(delegate
+                {
+                    _skipStreak = 0;
+                    if (_repeatMode == RepeatOne && _player.Current != null)
+                    {
+                        _auto = true;
+                        _player.Play(_player.Current, 0);
+                        RefreshAll();
+                    }
+                    else Skip(1, false);
+                });
+            };
             _player.TrackUnplayable += delegate
             {
                 SafeUi(delegate
@@ -146,7 +163,8 @@ namespace Spotipaq
         {
             _settings.Set("volume", _bar.Volume);
             _settings.Set("shuffle", _shuffle);
-            _settings.Set("repeat", _repeat);
+            _settings.Set("repeat", _repeatMode != RepeatOff);
+            _settings.Set("repeatMode", _repeatMode);
             if (full)
             {
                 Rectangle b = WindowState == FormWindowState.Normal ? Bounds : RestoreBounds;
@@ -509,7 +527,7 @@ namespace Spotipaq
         {
             if (_order.Count == 0) return;
             int next = _orderPos + delta;
-            if (next >= _order.Count) { if (_repeat || user) next = 0; else { _player.Stop(); RefreshAll(); return; } }
+            if (next >= _order.Count) { if (_repeatMode == RepeatAll || user) next = 0; else { _player.Stop(); RefreshAll(); return; } }
             if (next < 0) next = _order.Count - 1;
             _auto = !user;
             if (user) _skipStreak = 0;
@@ -531,7 +549,7 @@ namespace Spotipaq
             _bar.Playing = IsPlaying;
             _bar.PositionMs = _player.Current != null ? _player.PositionMs : _restoredPos;
             _bar.Shuffle = _shuffle;
-            _bar.Repeat = _repeat;
+            _bar.RepeatMode = _repeatMode;
             if (!_bar.DraggingVolume) _bar.Volume = _player.Volume;
             _bar.Invalidate();
             string title = t == null ? "Spotipaq" : t.Name + " - " + t.ArtistName;
