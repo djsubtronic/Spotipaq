@@ -1,0 +1,91 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <Import Project="$(MSBuildExtensionsPath)\$(MSBuildToolsVersion)\Microsoft.Common.props" Condition="Exists('$(MSBuildExtensionsPath)\$(MSBuildToolsVersion)\Microsoft.Common.props')" />
+  <PropertyGroup>
+    <Configuration Condition=" '$(Configuration)' == '' ">Debug</Configuration>
+    <Platform Condition=" '$(Platform)' == '' ">AnyCPU</Platform>
+    <ProjectGuid>{9B3D6C21-4E7A-4F58-8A1C-2D6E5B7F3A94}</ProjectGuid>
+    <OutputType>WinExe</OutputType>
+    <RootNamespace>Spotipaq</RootNamespace>
+    <AssemblyName>Spotipaq</AssemblyName>
+    <TargetFrameworkVersion>v2.0</TargetFrameworkVersion>
+    <FileAlignment>512</FileAlignment>
+    <Deterministic>true</Deterministic>
+    <ApplicationIcon>resources\spotipaq.ico</ApplicationIcon>
+    <StartupObject>Spotipaq.Program</StartupObject>
+  </PropertyGroup>
+  <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Debug|AnyCPU' ">
+    <!-- x86: the native Spotify/audio engine will be 32-bit, like NativePlayer. -->
+    <PlatformTarget>x86</PlatformTarget>
+    <DebugSymbols>true</DebugSymbols>
+    <DebugType>full</DebugType>
+    <Optimize>false</Optimize>
+    <OutputPath>bin\Debug\</OutputPath>
+    <DefineConstants>TRACE;DEBUG</DefineConstants>
+    <WarningLevel>4</WarningLevel>
+  </PropertyGroup>
+  <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Release|AnyCPU' ">
+    <PlatformTarget>x86</PlatformTarget>
+    <DebugType>pdbonly</DebugType>
+    <Optimize>true</Optimize>
+    <OutputPath>bin\Release\</OutputPath>
+    <DefineConstants>TRACE</DefineConstants>
+    <WarningLevel>4</WarningLevel>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="Newtonsoft.Json, Version=13.0.0.0, Culture=neutral, PublicKeyToken=30ad4fe6b2a6aeed, processorArchitecture=MSIL">
+      <HintPath>..\packages\Newtonsoft.Json.13.0.1\lib\net20\Newtonsoft.Json.dll</HintPath>
+    </Reference>
+    <Reference Include="System" />
+    <Reference Include="System.Security" />
+    <Reference Include="System.Drawing" />
+    <Reference Include="System.Windows.Forms" />
+  </ItemGroup>
+  <ItemGroup>
+    <Compile Include="Backend.cs" />
+    <Compile Include="Engine\ApSession.cs" />
+    <Compile Include="Engine\Native.cs" />
+    <Compile Include="Engine\OAuthLogin.cs" />
+    <Compile Include="Engine\Proto.cs" />
+    <Compile Include="Engine\Shannon.cs" />
+	<Compile Include="Engine\Spclient.cs" />	  
+    <Compile Include="Engine\SpotifyBackend.cs" />
+    <Compile Include="Engine\SpotifyEngine.cs" />
+	<Compile Include="Engine\SpotifyPlayback.cs" />
+    <Compile Include="LoginForm.cs">
+      <SubType>Form</SubType>
+    </Compile>
+    <Compile Include="Chrome.cs">
+      <SubType>Component</SubType>
+    </Compile>
+    <Compile Include="MainForm.cs">
+      <SubType>Form</SubType>
+    </Compile>
+    <Compile Include="MockBackend.cs" />
+    <Compile Include="Model.cs" />
+    <Compile Include="PageView.cs">
+      <SubType>Component</SubType>
+    </Compile>
+    <Compile Include="Program.cs" />
+    <Compile Include="Properties\AssemblyInfo.cs" />
+    <Compile Include="Theme.cs" />
+  </ItemGroup>
+  <ItemGroup>
+    <Content Include="resources\spotipaq.ico" />
+    <None Include="packages.config" />
+    <None Include="native\*.dll" />
+  </ItemGroup>
+  <PropertyGroup>
+    <!-- Always run the copy step below, so a rebuilt SpotipaqNative.dll reaches bin\. -->
+    <DisableFastUpToDateCheck>true</DisableFastUpToDateCheck>
+  </PropertyGroup>
+  <!-- native\ (SpotipaqNative.dll, filled by the SpotipaqNative project) is copied next to Spotipaq.exe. -->
+  <Target Name="CopyNativeRuntime" AfterTargets="Build">
+    <ItemGroup>
+      <NativeRuntime Include="$(MSBuildProjectDirectory)\native\*.dll" />
+    </ItemGroup>
+    <Copy SourceFiles="@(NativeRuntime)" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" />
+    <Warning Condition="!Exists('$(MSBuildProjectDirectory)\native\SpotipaqNative.dll')" Text="native\SpotipaqNative.dll is missing: build the SpotipaqNative project first." />
+  </Target>
+  <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
+</Project>

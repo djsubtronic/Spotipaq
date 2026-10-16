@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  SpotipaqNative.dll - XP / Pentium II helper for Spotipaq (https via OpenSSL 1.0.2u, big-number maths; audio later).
+  A "Makefile" project: Visual Studio edits and IntelliSenses spqnative.c, but Build / Rebuild /
+  Clean run build.cmd, which uses the proven VS2017 14.16 x86 command-line compiler with the XP flags.
+  It works from any Visual Studio version, as long as VS2017 Build Tools are installed.
+  Output: ..\Spotipaq\native\SpotipaqNative.dll.
+-->
+<Project DefaultTargets="Build" ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|Win32">
+      <Configuration>Debug</Configuration>
+      <Platform>Win32</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|Win32">
+      <Configuration>Release</Configuration>
+      <Platform>Win32</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>15.0</VCProjectVersion>
+    <ProjectGuid>{5E8A2C47-91D3-4B6F-A0E2-7C4D9B1F3A58}</ProjectGuid>
+    <Keyword>MakeFileProj</Keyword>
+    <RootNamespace>SpotipaqNative</RootNamespace>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Label="Configuration">
+    <ConfigurationType>Makefile</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <!-- The real compiler is chosen by build.cmd; this only satisfies the IDE. -->
+    <PlatformToolset>$(DefaultPlatformToolset)</PlatformToolset>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="ExtensionSettings" />
+  <PropertyGroup>
+    <OpenSslXpDir Condition="'$(OPENSSL_XP)' != ''">$(OPENSSL_XP)</OpenSslXpDir>
+    <OpenSslXpDir Condition="'$(OpenSslXpDir)' == ''">$(USERPROFILE)\Desktop\Home\YouTubeNativePlayer_Prototype\openssl-1.0.2u-xp</OpenSslXpDir>
+    <NMakeBuildCommandLine>call "$(ProjectDir)build.cmd"</NMakeBuildCommandLine>
+    <NMakeReBuildCommandLine>call "$(ProjectDir)build.cmd" clean &amp;&amp; call "$(ProjectDir)build.cmd"</NMakeReBuildCommandLine>
+    <NMakeCleanCommandLine>call "$(ProjectDir)build.cmd" clean</NMakeCleanCommandLine>
+    <NMakeOutput>$(ProjectDir)..\Spotipaq\native\SpotipaqNative.dll</NMakeOutput>
+    <NMakePreprocessorDefinitions>WIN32;_WINDOWS;WINVER=0x0501;_WIN32_WINNT=0x0501;_CRT_SECURE_NO_WARNINGS</NMakePreprocessorDefinitions>
+    <NMakeIncludeSearchPath>$(OpenSslXpDir)\include;$(NMakeIncludeSearchPath)</NMakeIncludeSearchPath>
+    <OutDir>$(ProjectDir)obj\</OutDir>
+    <IntDir>$(ProjectDir)obj\vs\</IntDir>
+  </PropertyGroup>
+  <ItemGroup>
+    <ClCompile Include="spqnative.c" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="build.cmd" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets" />
+</Project>
