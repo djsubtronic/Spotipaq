@@ -142,6 +142,13 @@ namespace Spotipaq
 
         protected override void OnHandleCreated(EventArgs e) { base.OnHandleCreated(e); AppIcon.Apply(this); }
 
+        // WinForms re-sends its own (shrunken) small icon now and then; always answer with the 16x16 frame AppIcon picked
+        protected override void WndProc(ref Message m)
+        {
+            if (m.Msg == 0x0080 && m.WParam == IntPtr.Zero && AppIcon.Small != IntPtr.Zero) m.LParam = AppIcon.Small;
+            base.WndProc(ref m);
+        }
+
         void RestoreWindow()
         {
             int w = _settings.GetInt("win.w", 0), h = _settings.GetInt("win.h", 0), x = _settings.GetInt("win.x", 0), y = _settings.GetInt("win.y", 0);

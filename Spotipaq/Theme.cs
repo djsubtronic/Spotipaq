@@ -497,8 +497,31 @@ namespace Spotipaq
     {
         [DllImport("shell32.dll", CharSet = CharSet.Auto)] static extern int ExtractIconEx(string file, int index, IntPtr[] large, IntPtr[] small, int count);
         [DllImport("user32.dll")] static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
+        [DllImport("user32.dll")] static extern IntPtr CreateIconFromResourceEx(byte[] bits, int size, bool icon, int ver, int cx, int cy, int flags);
         static IntPtr _small, _large;
         static bool _loaded;
+        const int SmallBits = 32;      // taskbar icon: 32 = alpha-blended 16x16 frame, 24 = the matte frame
+
+        /// <summary>The small (16x16) icon chosen for the taskbar; Zero until Apply has run.</summary>
+        public static IntPtr Small { get { return _small; } }
+
+        // HICON from the .ico frame with the given size and bit depth, picked here instead of by Windows or .NET:
+        // on a 24-bit display XP ignores the 32-bit alpha frame and would otherwise fall back to the rough 8-bit one.
+        static IntPtr Frame(byte[] ico, int size, int bits)
+        {
+            int n = ico[4] | (ico[5] << 8), best = -1;
+            for (int i = 0; i < n; i++)
+            {
+                int e = 6 + 16 * i;
+                int w = ico[e] == 0 ? 256 : ico[e], bpp = ico[e + 6] | (ico[e + 7] << 8);
+                if (w == size && bpp == bits) { best = e; break; }
+            }
+            if (best < 0) return IntPtr.Zero;
+            int len = BitConverter.ToInt32(ico, best + 8), off = BitConverter.ToInt32(ico, best + 12);
+            byte[] img = new byte[len];
+            Array.Copy(ico, off, img, 0, len);
+            return CreateIconFromResourceEx(img, len, true, 0x00030000, size, size, 0);
+        }
 
         public static void Apply(Form f)
         {
@@ -509,6 +532,20 @@ namespace Spotipaq
                     _loaded = true;
                     IntPtr[] l = new IntPtr[1], s = new IntPtr[1];
                     if (ExtractIconEx(Application.ExecutablePath, 0, l, s, 1) > 0) { _large = l[0]; _small = s[0]; }
+                    try
+                    {
+                        using (System.IO.Stream st = System.Reflection.Assembly.GetExecutingAssembly().GetManifestResourceStream("spotipaq.ico"))
+                            if (st != null)
+                            {
+                                byte[] ico = new byte[st.Length];
+                                int got = 0;
+                                while (got < ico.Length) { int r = st.Read(ico, got, ico.Length - got); if (r <= 0) break; got += r; }
+                                IntPtr h = Frame(ico, 16, SmallBits);
+                                if (h == IntPtr.Zero) h = Frame(ico, 16, 24);
+                                if (h != IntPtr.Zero) _small = h;
+                            }
+                    }
+                    catch { }
                 }
                 if (f.IsHandleCreated)
                 {

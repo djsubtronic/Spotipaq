@@ -72,6 +72,9 @@
   </ItemGroup>
   <ItemGroup>
     <Content Include="resources\spotipaq.ico" />
+    <EmbeddedResource Include="resources\spotipaq.ico">
+      <LogicalName>spotipaq.ico</LogicalName>
+    </EmbeddedResource>
     <None Include="packages.config" />
   </ItemGroup>
   <ItemGroup>
