@@ -4,6 +4,7 @@ using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.IO;
+using System.Text;
 using Newtonsoft.Json.Linq;
 
 namespace Spotipaq.Engine
@@ -86,7 +87,7 @@ namespace Spotipaq.Engine
             return null;
         }
 
-        static string Str(Dictionary<int, List<ProtoField>> d, int n) { ProtoField? f = ProtoReader.First(d, n); return f == null ? null : f.Value.Text; }
+        static string Str(Dictionary<int, List<ProtoField>> d, int n) { ProtoField? f = ProtoReader.First(d, n); return f == null ? null : TextUtil.Decode(f.Value.Text); }
         static int Sint(Dictionary<int, List<ProtoField>> d, int n) { ProtoField? f = ProtoReader.First(d, n); return f == null ? 0 : ProtoReader.Zigzag(f.Value.Int); }
 
         static Artist ParseArtistRef(ProtoField f)
@@ -237,7 +238,7 @@ namespace Spotipaq.Engine
         static string J(JToken t, string path)
         {
             if (t == null) return null;
-            try { JToken r = t.SelectToken(path); return r == null || r.Type == JTokenType.Null ? null : (string)r; } catch { return null; }
+            try { JToken r = t.SelectToken(path); return r == null || r.Type == JTokenType.Null ? null : TextUtil.Decode((string)r); } catch { return null; }
         }
 
         static Track JsonTrack(JToken d, string uri)
@@ -299,7 +300,7 @@ namespace Spotipaq.Engine
             Playlist p = new Playlist();
             p.Id = LastPart(J(d, "uri"));
             p.Name = J(d, "name");
-            p.Description = J(d, "description");
+            p.Description = TextUtil.Clean(J(d, "description"));
             p.Owner = J(d, "ownerV2.data.name") ?? J(d, "owner.name");
             p.ImageUrl = Src(d.SelectToken("images.items[0].sources"), 300);
             return p;
@@ -358,93 +359,29 @@ namespace Spotipaq.Engine
             return list;
         }
 
-        // Spotify's first-party Pathfinder library mutation, rather than the public Web API
-        // (the shared desktop client is frequently rate-limited on api.spotify.com).
-        // Hash verified in the Meld web-player registry on 2026-10-13.
-        const string HashLibraryMutation = "896ebcb47815681340860d121cb5d494e157e2a78d3950385cd54e0393c67148";
-
         public void SetSaved(string uri, bool saved)
         {
-            if (String.IsNullOrEmpty(uri) || !uri.StartsWith("spotify:", StringComparison.Ordinal))
-                throw new ArgumentException("Invalid Spotify library URI.", "uri");
-
-            // Pathfinder addToLibrary does not accept PLAYLIST items. Playlists belong
-            // to the user's playlist4 rootlist, not the ordinary media library.
-            if (uri.StartsWith("spotify:playlist:", StringComparison.Ordinal))
+            string method = saved ? "PUT" : "DELETE";
+            HttpResult r = _sp.Api(method, "/me/library?uris=" + System.Uri.EscapeDataString(uri));
+            if (!r.Ok && (r.Status == 404 || r.Status == 405 || r.Status == 400))
             {
-                SetPlaylistSaved(uri, saved);
-                return;
+                // older Web API shape
+                string[] parts = uri.Split(':');
+                string kind = parts.Length > 2 ? parts[1] : "", id = parts.Length > 2 ? parts[2] : "";
+                string path = null;
+                if (kind == "track") path = "/me/tracks?ids=" + id;
+                else if (kind == "album") path = "/me/albums?ids=" + id;
+                else if (kind == "artist") path = "/me/following?type=artist&ids=" + id;
+                else if (kind == "playlist") path = "/playlists/" + id + "/followers";
+                if (path != null) r = _sp.Api(method, path);
             }
-
-            string operation = saved ? "addToLibrary" : "removeFromLibrary";
-            JObject variables = new JObject();
-            variables["libraryItemUris"] = new JArray(uri);
-            JObject data = _sp.Pathfinder(operation, HashLibraryMutation, variables);
-            if (data == null)
-                throw new InvalidOperationException("Spotify returned no data for " + operation + ".");
-            Log.Write((saved ? "Saved " : "Removed ") + uri + " via Pathfinder");
-        }
-
-        // Playlist4 rootlist is the authoritative list of playlists followed by a user.
-        // Read the revision before each mutation, and independently check membership
-        // afterwards: a 2xx response alone does not mean the change was applied.
-        void SetPlaylistSaved(string uri, bool saved)
-        {
-            string user = _engine.EnsureConnected().Username;
-            string rootPath = "/playlist/v2/user/" + System.Uri.EscapeDataString(user) + "/rootlist";
-            string readPath = rootPath + "?decorate=revision%2Cattributes%2Clength&from=0&length=2000";
-            HttpResult before = _sp.Sp("GET", readPath, null, null);
-            if (!before.Ok) throw new InvalidOperationException("Couldn't read your playlist library (HTTP " + before.Status + ").");
-            Dictionary<int, List<ProtoField>> root = new ProtoReader(before.Body).ReadAll();
-            ProtoField? revision = ProtoReader.First(root, 1);
-            if (revision == null || revision.Value.Data == null || revision.Value.Data.Length == 0)
-                throw new InvalidOperationException("Spotify's playlist rootlist has no revision; refusing to write without one.");
-            bool isPresent = RootlistContains(root, uri);
-            if (isPresent == saved) return;
-
-            ProtoWriter item = new ProtoWriter().String(1, uri);
-            ProtoWriter operation;
-            if (saved)
+            if (!r.Ok)
             {
-                // Op.Kind ADD=2; Op.add=2; Add.from_index=1; Add.items=2.
-                ProtoWriter add = new ProtoWriter().Int(1, 0).Message(2, item);
-                operation = new ProtoWriter().Int(1, 2).Message(2, add);
+                string detail = "";
+                try { detail = r.Text != null && r.Text.Length > 0 ? " - " + (r.Text.Length > 160 ? r.Text.Substring(0, 160) : r.Text) : ""; } catch { }
+                throw new InvalidOperationException("Spotify wouldn't " + (saved ? "save" : "remove") + " that (HTTP " + r.Status + ")" + detail);
             }
-            else
-            {
-                // Op.Kind REM=3; Op.rem=3; Rem.items=3; Rem.items_as_key=7.
-                ProtoWriter rem = new ProtoWriter().Message(3, item).Bool(7, true);
-                operation = new ProtoWriter().Int(1, 3).Message(3, rem);
-            }
-            ProtoWriter delta = new ProtoWriter().Bytes(1, revision.Value.Data).Message(2, operation);
-            ProtoWriter changes = new ProtoWriter().Bytes(1, revision.Value.Data)
-                .Message(2, delta).Bool(3, true).Bool(4, true);
-            HttpResult result = _sp.Sp("POST", rootPath + "/changes", changes.ToArray(), "application/x-protobuf");
-            if (!result.Ok)
-                throw new InvalidOperationException("Spotify rejected the playlist library change (HTTP " + result.Status + ").");
-
-            HttpResult after = _sp.Sp("GET", readPath, null, null);
-            if (!after.Ok)
-                throw new InvalidOperationException("Spotify accepted the request but the playlist library could not be checked (HTTP " + after.Status + ").");
-            Dictionary<int, List<ProtoField>> updated = new ProtoReader(after.Body).ReadAll();
-            if (RootlistContains(updated, uri) != saved)
-                throw new InvalidOperationException("Spotify accepted the playlist change but did not reflect it in your rootlist. No local change was made.");
-            Log.Write((saved ? "Followed " : "Unfollowed ") + uri + " via playlist4 rootlist");
-        }
-
-        static bool RootlistContains(Dictionary<int, List<ProtoField>> root, string uri)
-        {
-            ProtoField? contents = ProtoReader.First(root, 5);
-            if (contents == null) return false;
-            Dictionary<int, List<ProtoField>> list = contents.Value.Message.ReadAll();
-            List<ProtoField> items;
-            if (!list.TryGetValue(3, out items)) return false;
-            foreach (ProtoField item in items)
-            {
-                ProtoField? name = ProtoReader.First(item.Message.ReadAll(), 1);
-                if (name != null && String.Equals(name.Value.Text, uri, StringComparison.Ordinal)) return true;
-            }
-            return false;
+            Log.Write((saved ? "Saved " : "Removed ") + uri);
         }
 
         public string GetSongRadio(string trackId)
@@ -472,7 +409,7 @@ namespace Spotipaq.Engine
             {
                 Dictionary<int, List<ProtoField>> a = at.Value.Message.ReadAll();
                 attrs = a;
-                p.Name = Str(a, 1); p.Description = Str(a, 2);
+                p.Name = Str(a, 1); p.Description = TextUtil.Clean(Str(a, 2));
             }
             List<string> ids = new List<string>();
             ProtoField? contents = ProtoReader.First(top, 5);
@@ -738,6 +675,70 @@ namespace Spotipaq.Engine
             using (MemoryStream ms = new MemoryStream(r.Body))
             using (Image img = Image.FromStream(ms))
                 return new Bitmap(img);
+        }
+    }
+
+    /// <summary>Spotify sometimes sends HTML-escaped text (&amp;apos; &amp;amp; &amp;#39; ...). .NET 2.0 has no WebUtility, so this is a small decoder.</summary>
+    public static class TextUtil
+    {
+        static readonly string[] Latin1 = ("nbsp iexcl cent pound curren yen brvbar sect uml copy ordf laquo not shy reg macr deg plusmn sup2 sup3 acute micro para middot cedil sup1 ordm raquo frac14 frac12 frac34 iquest " +
+            "Agrave Aacute Acirc Atilde Auml Aring AElig Ccedil Egrave Eacute Ecirc Euml Igrave Iacute Icirc Iuml ETH Ntilde Ograve Oacute Ocirc Otilde Ouml times Oslash Ugrave Uacute Ucirc Uuml Yacute THORN szlig " +
+            "agrave aacute acirc atilde auml aring aelig ccedil egrave eacute ecirc euml igrave iacute icirc iuml eth ntilde ograve oacute ocirc otilde ouml divide oslash ugrave uacute ucirc uuml yacute thorn yuml").Split(' ');
+        static readonly Dictionary<string, char> Named = BuildNamed();
+
+        static Dictionary<string, char> BuildNamed()
+        {
+            Dictionary<string, char> d = new Dictionary<string, char>();
+            d["amp"] = '&'; d["lt"] = '<'; d["gt"] = '>'; d["quot"] = '"'; d["apos"] = '\'';
+            d["hellip"] = '\u2026'; d["ndash"] = '\u2013'; d["mdash"] = '\u2014'; d["lsquo"] = '\u2018'; d["rsquo"] = '\u2019';
+            d["ldquo"] = '\u201C'; d["rdquo"] = '\u201D'; d["bull"] = '\u2022'; d["trade"] = '\u2122'; d["euro"] = '\u20AC';
+            for (int i = 0; i < Latin1.Length; i++) d[Latin1[i]] = (char)(160 + i);
+            return d;
+        }
+
+        /// <summary>Decodes &amp;name; and &amp;#123; / &amp;#x1F; entities (repeats, in case the text was escaped twice).</summary>
+        public static string Decode(string s)
+        {
+            for (int pass = 0; pass < 3 && s != null && s.IndexOf('&') >= 0; pass++)
+            {
+                StringBuilder sb = new StringBuilder(s.Length);
+                bool changed = false;
+                for (int i = 0; i < s.Length; i++)
+                {
+                    char ch = s[i];
+                    if (ch == '&')
+                    {
+                        int semi = s.IndexOf(';', i + 1);
+                        if (semi > i + 1 && semi - i <= 10)
+                        {
+                            string name = s.Substring(i + 1, semi - i - 1);
+                            string decoded = null;
+                            if (name[0] == '#')
+                            {
+                                int code;
+                                bool ok = name.Length > 2 && (name[1] == 'x' || name[1] == 'X')
+                                    ? Int32.TryParse(name.Substring(2), System.Globalization.NumberStyles.HexNumber, System.Globalization.CultureInfo.InvariantCulture, out code)
+                                    : Int32.TryParse(name.Substring(1), out code);
+                                if (ok && code > 0 && code < 0x110000) decoded = Char.ConvertFromUtf32(code);
+                            }
+                            else { char n; if (Named.TryGetValue(name, out n)) decoded = n.ToString(); }
+                            if (decoded != null) { sb.Append(decoded); i = semi; changed = true; continue; }
+                        }
+                    }
+                    sb.Append(ch);
+                }
+                s = sb.ToString();
+                if (!changed) break;
+            }
+            return s;
+        }
+
+        /// <summary>For descriptions: removes tags like &lt;a href=...&gt; and decodes entities.</summary>
+        public static string Clean(string s)
+        {
+            if (s == null) return null;
+            if (s.IndexOf('<') >= 0) s = System.Text.RegularExpressions.Regex.Replace(s, "<[^>]*>", "");
+            return Decode(s).Trim();
         }
     }
 }
