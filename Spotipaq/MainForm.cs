@@ -17,6 +17,10 @@ namespace Spotipaq
         readonly PageView _page;
         readonly Timer _tick = new Timer();
 
+        // An external URL waits for the corresponding page data before starting playback.
+        string _linkTargetKind, _linkTargetId, _linkTrackId;
+        int _linkSerial;
+
         // navigation
         readonly List<NavTarget> _history = new List<NavTarget>();
         int _historyIndex = -1;
@@ -264,6 +268,16 @@ namespace Spotipaq
                 Engine.Log.Flush();
                 try { System.Diagnostics.Process.Start("notepad.exe", "\"" + Engine.Log.FilePath + "\""); } catch { }
             });
+            m.Items.Add("Open Spotify link from clipboard", null, delegate
+            {
+                try
+                {
+                    if (Clipboard.ContainsText()) OpenSpotifyLink(Clipboard.GetText());
+                    else MessageBox.Show(this, "Copy a Spotify link first.", "Spotipaq",
+                        MessageBoxButtons.OK, MessageBoxIcon.Information);
+                }
+                catch (Exception ex) { MessageBox.Show(this, ex.Message, "Spotipaq"); }
+            });
             m.Items.Add("Open Spotipaq folder", null, delegate
             {
                 try { System.Diagnostics.Process.Start("explorer.exe", "\"" + Engine.Log.Folder + "\""); } catch { }
@@ -296,6 +310,107 @@ namespace Spotipaq
             else m();
         }
 
+        /// <summary>Called on the UI thread when the application receives a Spotify link.</summary>
+        public void OpenSpotifyLink(string link)
+        {
+            string kind, id;
+            if (!TrySpotifyLink(link, out kind, out id))
+            {
+                MessageBox.Show(this, "Not a supported Spotify track, album, artist or playlist link.",
+                    "Spotipaq", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            if (!(_backend is Engine.SpotifyBackend))
+            {
+                MessageBox.Show(this, "Sign in to Spotify to open links.", "Spotipaq",
+                    MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            if (WindowState == FormWindowState.Minimized) WindowState = FormWindowState.Normal;
+            Show(); Activate();
+            _linkSerial++;
+            _linkTargetKind = kind; _linkTargetId = id; _linkTrackId = null;
+            if (kind == "track")
+            {
+                int serial = _linkSerial;
+                Async.Run(this, delegate { return ((Engine.SpotifyBackend)_backend).GetLinkedTrack(id); },
+                    delegate (Track track, Exception err)
+                    {
+                        if (serial != _linkSerial) return;
+                        if (track == null) { LinkedError(err); return; }
+                        if (String.IsNullOrEmpty(track.AlbumId))
+                        {
+                            List<Track> one = new List<Track>(); one.Add(track);
+                            _linkTargetKind = null;
+                            PlayList(one, 0);
+                            return;
+                        }
+                        _linkTargetKind = "album";
+                        _linkTargetId = track.AlbumId;
+                        _linkTrackId = id;
+                        NavigateLinked(new NavTarget(PageKind.Album, track.AlbumId));
+                    });
+            }
+            else
+                NavigateLinked(new NavTarget(kind == "album" ? PageKind.Album :
+                    kind == "artist" ? PageKind.Artist : PageKind.Playlist, id));
+        }
+
+        void NavigateLinked(NavTarget target)
+        {
+            if (target.SameAs(Current)) ShowPage(target);
+            else Navigate(target);
+        }
+
+        void LinkedError(Exception error)
+        {
+            _linkTargetKind = null;
+            MessageBox.Show(this, error == null ? "Could not open Spotify link." : error.Message,
+                "Spotipaq", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+
+        void PlayLinkedPage(string kind, string id, List<Track> tracks)
+        {
+            if (_linkTargetKind != kind || _linkTargetId != id) return;
+            string trackId = _linkTrackId;
+            _linkTargetKind = null; _linkTrackId = null;
+            if (tracks == null || tracks.Count == 0) return;
+            int index = 0;
+            if (trackId != null)
+                for (int i = 0; i < tracks.Count; i++)
+                    if (tracks[i].Id == trackId) { index = i; break; }
+            PlayList(tracks, index);
+        }
+
+        static bool TrySpotifyLink(string raw, out string kind, out string id)
+        {
+            kind = id = null;
+            if (String.IsNullOrEmpty(raw)) return false;
+            string[] parts = null;
+            raw = raw.Trim().Trim('"');
+            if (raw.StartsWith("spotify:", StringComparison.OrdinalIgnoreCase))
+                parts = raw.Substring(8).Split(':');
+            else
+            {
+                Uri uri;
+                if (!Uri.TryCreate(raw, UriKind.Absolute, out uri) ||
+                    (uri.Scheme != "https" && uri.Scheme != "http") ||
+                    !(uri.Host.Equals("open.spotify.com", StringComparison.OrdinalIgnoreCase) ||
+                      uri.Host.Equals("play.spotify.com", StringComparison.OrdinalIgnoreCase))) return false;
+                string path = uri.AbsolutePath.Trim('/');
+                if (path.StartsWith("intl-", StringComparison.OrdinalIgnoreCase))
+                    path = path.Substring(path.IndexOf('/') + 1);
+                parts = path.Split('/');
+            }
+            if (parts.Length < 2) return false;
+            kind = parts[0].ToLowerInvariant(); id = parts[1];
+            if (kind != "track" && kind != "album" && kind != "artist" && kind != "playlist") return false;
+            if (id.Length != 22) return false;
+            foreach (char ch in id)
+                if (!((ch >= '0' && ch <= '9') || (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z'))) return false;
+            return true;
+        }
+
         // ============================================================================ IPageHost
         public ImageCache Images { get { return _images; } }
         public Track PlayingTrack { get { return _player.Current; } }
@@ -306,6 +421,9 @@ namespace Spotipaq
         public void Navigate(NavTarget target)
         {
             if (target == null || target.SameAs(Current)) return;
+            if (_linkTargetKind != null &&
+                !(target.Id == _linkTargetId && target.Kind.ToString().Equals(_linkTargetKind, StringComparison.OrdinalIgnoreCase)))
+                _linkTargetKind = null;
             _history.RemoveRange(_historyIndex + 1, _history.Count - _historyIndex - 1);   // drop "forward"
             _history.Add(target);
             if (_history.Count > 50) _history.RemoveAt(0);
@@ -611,9 +729,9 @@ namespace Spotipaq
             {
                 case PageKind.Browse: LoadPage("Browse", delegate { return _backend.GetBrowse(); }, delegate (List<BrowseSection> r, Exception e) { _page.SetBlocks(BrowsePage(r)); }); break;
                 case PageKind.Search: LoadPage("results", delegate { return _backend.Search(t.Id); }, delegate (SearchResults r, Exception e) { _page.SetBlocks(SearchPage(r)); }); break;
-                case PageKind.Album: LoadPage("album", delegate { return _backend.GetAlbum(t.Id); }, delegate (Album r, Exception e) { _page.SetBlocks(AlbumPage(r)); }); break;
-                case PageKind.Artist: LoadPage("artist", delegate { return _backend.GetArtist(t.Id); }, delegate (ArtistPage r, Exception e) { _page.SetBlocks(ArtistPageBlocks(r)); }); break;
-                case PageKind.Playlist: LoadPage("playlist", delegate { return _backend.GetPlaylist(t.Id); }, delegate (Playlist r, Exception e) { _page.SetBlocks(PlaylistPage(r)); }); break;
+                case PageKind.Album: LoadPage("album", delegate { return _backend.GetAlbum(t.Id); }, delegate (Album r, Exception e) { _page.SetBlocks(AlbumPage(r)); PlayLinkedPage("album", t.Id, r.Tracks); }); break;
+                case PageKind.Artist: LoadPage("artist", delegate { return _backend.GetArtist(t.Id); }, delegate (ArtistPage r, Exception e) { _page.SetBlocks(ArtistPageBlocks(r)); PlayLinkedPage("artist", t.Id, r.Popular); }); break;
+                case PageKind.Playlist: LoadPage("playlist", delegate { return _backend.GetPlaylist(t.Id); }, delegate (Playlist r, Exception e) { _page.SetBlocks(PlaylistPage(r)); PlayLinkedPage("playlist", t.Id, r.Tracks); }); break;
                 case PageKind.Songs: LoadPage("songs", delegate { return _backend.GetSavedTracks(); }, delegate (List<Track> r, Exception e) { _page.SetBlocks(SongsPage(r)); }); break;
                 case PageKind.Albums: LoadPage("albums", delegate { return _backend.GetSavedAlbums(); }, delegate (List<Album> r, Exception e) { _page.SetBlocks(AlbumsPage(r)); }); break;
                 case PageKind.Artists: LoadPage("artists", delegate { return _backend.GetFollowedArtists(); }, delegate (List<Artist> r, Exception e) { _page.SetBlocks(ArtistsPage(r)); }); break;

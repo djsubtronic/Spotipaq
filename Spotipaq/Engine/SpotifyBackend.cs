@@ -468,6 +468,18 @@ namespace Spotipaq.Engine
 
         // ---------- albums + artists ----------
 
+        // Resolve a shared track link without searching by title (which can pick a different version).
+        public Track GetLinkedTrack(string id)
+        {
+            string uri = Uri("track", id);
+            Dictionary<string, byte[]> data = _sp.ExtMeta(10, new string[] { uri });
+            byte[] raw;
+            if (!data.TryGetValue(uri, out raw)) throw new InvalidOperationException("Track not available");
+            Track track = ParseTrack(raw);
+            track.Id = id;
+            return track;
+        }
+
         public Album GetAlbum(string id)
         {
             Dictionary<string, byte[]> meta = _sp.ExtMeta(9, new string[] { Uri("album", id) });
