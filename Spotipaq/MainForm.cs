@@ -123,6 +123,7 @@ namespace Spotipaq
             {
                 if (_player.State == PlayState.Playing) RefreshBar();
                 if (_volumeDirty && (MouseButtons & MouseButtons.Left) == 0) { _volumeDirty = false; SaveSettings(false); }
+                if (_mediaKeysMissing && ++_mediaKeyRetry >= 10) { _mediaKeyRetry = 0; RegisterMediaKeys(); }     // another player (Winamp...) may let go of them later
             };
             _tick.Start();
             Application.AddMessageFilter(this);
@@ -144,12 +145,68 @@ namespace Spotipaq
 
         bool _volumeDirty;
 
-        protected override void OnHandleCreated(EventArgs e) { base.OnHandleCreated(e); AppIcon.Apply(this); }
+        protected override void OnHandleCreated(EventArgs e) { base.OnHandleCreated(e); AppIcon.Apply(this); RegisterMediaKeys(); }
+
+        protected override void OnHandleDestroyed(EventArgs e)
+        {
+            UnregisterMediaKeys();
+            base.OnHandleDestroyed(e);
+        }
+
+        // ---- global media keys (play/pause, next, previous, stop), work whichever program has focus.
+        // A key can only belong to one program at a time: if another player already owns it the registration fails
+        // quietly and is retried every few seconds, so Spotipaq picks the key up once the other player lets go.
+        [System.Runtime.InteropServices.DllImport("user32.dll")] static extern bool RegisterHotKey(IntPtr hWnd, int id, uint modifiers, uint vk);
+        [System.Runtime.InteropServices.DllImport("user32.dll")] static extern bool UnregisterHotKey(IntPtr hWnd, int id);
+        const int WM_HOTKEY = 0x0312;
+        static readonly uint[] MediaVk = { 0xB3, 0xB0, 0xB1, 0xB2 };        // VK_MEDIA_PLAY_PAUSE, NEXT_TRACK, PREV_TRACK, STOP
+        const int HotkeyBase = 0x5B10;                                       // our own hotkey ids
+        readonly bool[] _mediaKeyOk = new bool[4];
+        bool _mediaKeysMissing = true;
+        int _mediaKeyRetry;
+
+        void RegisterMediaKeys()
+        {
+            if (!IsHandleCreated) return;
+            bool missing = false;
+            for (int i = 0; i < MediaVk.Length; i++)
+            {
+                if (_mediaKeyOk[i]) continue;
+                try { _mediaKeyOk[i] = RegisterHotKey(Handle, HotkeyBase + i, 0, MediaVk[i]); }
+                catch (Exception) { _mediaKeyOk[i] = false; }
+                if (!_mediaKeyOk[i]) missing = true;
+            }
+            _mediaKeysMissing = missing;
+        }
+
+        void UnregisterMediaKeys()
+        {
+            if (!IsHandleCreated) return;
+            for (int i = 0; i < MediaVk.Length; i++)
+                if (_mediaKeyOk[i]) { try { UnregisterHotKey(Handle, HotkeyBase + i); } catch (Exception) { } _mediaKeyOk[i] = false; }
+            _mediaKeysMissing = true;
+        }
+
+        void OnMediaKey(int which)
+        {
+            switch (which)
+            {
+                case 0: TogglePlayPause(); break;
+                case 1: Skip(1, true); break;
+                case 2: Previous(); break;
+                case 3: _player.Stop(); RefreshAll(); break;
+            }
+        }
 
         // WinForms re-sends its own (shrunken) small icon now and then; always answer with the 16x16 frame AppIcon picked
         protected override void WndProc(ref Message m)
         {
             if (m.Msg == 0x0080 && m.WParam == IntPtr.Zero && AppIcon.Small != IntPtr.Zero) m.LParam = AppIcon.Small;
+            if (m.Msg == WM_HOTKEY)
+            {
+                int which = m.WParam.ToInt32() - HotkeyBase;
+                if (which >= 0 && which < MediaVk.Length) { OnMediaKey(which); return; }
+            }
             base.WndProc(ref m);
         }
 
