@@ -235,15 +235,41 @@ namespace Spotipaq
             _settings.Set("repeatMode", _repeatMode);
             if (full)
             {
-                Rectangle b = WindowState == FormWindowState.Normal ? Bounds : RestoreBounds;
-                _settings.Set("win.x", b.X); _settings.Set("win.y", b.Y); _settings.Set("win.w", b.Width); _settings.Set("win.h", b.Height);
-                _settings.Set("win.max", WindowState == FormWindowState.Maximized);
+                TrackWindow();
+                Rectangle b = _lastNormal;
+                if (b.Width > 0) { _settings.Set("win.x", b.X); _settings.Set("win.y", b.Y); _settings.Set("win.w", b.Width); _settings.Set("win.h", b.Height); }
+                _settings.Set("win.max", _lastMax);
                 NavTarget t = Current;
                 if (t != null) { _settings.Set("page.kind", t.Kind.ToString()); _settings.Set("page.id", t.Id); }
                 Track tr = _player.Current ?? _restored;
                 if (tr != null) _settings.SetTrack(tr, _player.Current != null ? _player.PositionMs : _restoredPos);
             }
             _settings.Save();
+        }
+
+        // Last known non-minimized window state. Closing while minimized (or during logoff) would otherwise
+        // report Minimized and lose the maximized flag.
+        Rectangle _lastNormal; bool _lastMax;
+
+        void TrackWindow()
+        {
+            if (!IsHandleCreated) return;
+            if (WindowState == FormWindowState.Minimized) return;
+            _lastMax = WindowState == FormWindowState.Maximized;
+            Rectangle b = WindowState == FormWindowState.Normal ? Bounds : RestoreBounds;
+            if (b.Width >= MinimumSize.Width && b.Height >= MinimumSize.Height) _lastNormal = b;
+        }
+
+        protected override void OnResize(EventArgs e)
+        {
+            base.OnResize(e);
+            TrackWindow();
+        }
+
+        protected override void OnMove(EventArgs e)
+        {
+            base.OnMove(e);
+            TrackWindow();
         }
 
         protected override void OnFormClosing(FormClosingEventArgs e)
@@ -264,6 +290,7 @@ namespace Spotipaq
         {
             base.OnLoad(e);
             if (_settings.GetBool("win.max", false)) WindowState = FormWindowState.Maximized;
+            TrackWindow();
             _sidebar.SetPlaylists(null);
             _top.SetUser("Connecting...");
             _bar.Volume = _player.Volume;
