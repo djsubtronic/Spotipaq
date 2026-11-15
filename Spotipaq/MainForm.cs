@@ -42,6 +42,7 @@ namespace Spotipaq
         bool _auto;                              // the current track was started by auto-advance (not by a click)
         int _skipStreak;                         // unplayable tracks skipped in a row
         Track _restored; int _restoredPos;      // last track from the previous run (shown paused in the bar until you press play)
+        bool _queueDirty;                        // the queue or its play order changed since queue.txt was last written
 
         public MainForm(ISpotifyBackend backend, IPlayback player)
         {
@@ -63,6 +64,7 @@ namespace Spotipaq
                                           : (_settings.GetBool("repeat", false) ? RepeatAll : RepeatOff);
             _player.Volume = Math.Max(0, Math.Min(100, _settings.GetInt("volume", 80)));
             int pos; _restored = _settings.GetTrack(out pos); _restoredPos = pos;
+            RestoreQueue();
 
             _images = new ImageCache(backend, this);
             _page = new PageView(this);
@@ -243,6 +245,8 @@ namespace Spotipaq
                 if (t != null) { _settings.Set("page.kind", t.Kind.ToString()); _settings.Set("page.id", t.Id); }
                 Track tr = _player.Current ?? _restored;
                 if (tr != null) _settings.SetTrack(tr, _player.Current != null ? _player.PositionMs : _restoredPos);
+                _settings.Set("queue.pos", _orderPos);
+                if (_queueDirty && _queue.Count > 0) { AppSettings.SaveQueue(_queue, _order); _queueDirty = false; }
             }
             _settings.Save();
         }
@@ -385,6 +389,24 @@ namespace Spotipaq
                 Close();
             });
             _top.UserMenu = m;
+        }
+
+        /// <summary>Brings back the previous run's play queue, so play / next / previous carry on through the same
+        /// playlist. Kept only if it still contains the restored track; otherwise that track plays on its own.</summary>
+        void RestoreQueue()
+        {
+            if (_restored == null) return;
+            List<Track> queue; List<int> order;
+            if (!AppSettings.LoadQueue(out queue, out order)) return;
+            int at = _settings.GetInt("queue.pos", -1);
+            if (at < 0 || at >= order.Count || queue[order[at]].Id != _restored.Id)
+            {
+                at = -1;
+                for (int i = 0; i < order.Count; i++)
+                    if (queue[order[i]].Id == _restored.Id) { at = i; break; }
+                if (at < 0) return;
+            }
+            _queue = queue; _order = order; _orderPos = at;
         }
 
         void SafeUi(MethodInvoker m)
@@ -532,6 +554,7 @@ namespace Spotipaq
             _auto = false; _skipStreak = 0;
             _queue = new List<Track>(tracks);
             BuildOrder(index);
+            _queueDirty = true;
             PlayAt(_orderPos);
         }
 
@@ -543,9 +566,15 @@ namespace Spotipaq
             {
                 Track t = _restored; int at = _restoredPos;
                 _restored = null;
-                _queue = new List<Track>(); _queue.Add(t);
-                BuildOrder(0);
-                _orderPos = 0;
+                if (_queue.Count > 0 && _orderPos >= 0 && _orderPos < _order.Count && _queue[_order[_orderPos]].Id == t.Id)
+                    t = _queue[_order[_orderPos]];          // the queue from last time came back: carry on inside it
+                else
+                {
+                    _queue = new List<Track>(); _queue.Add(t);
+                    BuildOrder(0);
+                    _orderPos = 0;
+                    _queueDirty = true;
+                }
                 _player.Play(t, at);
             }
             else if (_queue.Count > 0) PlayAt(Math.Max(0, _orderPos));
@@ -694,6 +723,7 @@ namespace Spotipaq
             _queue.Add(t);
             int qi = _queue.Count - 1;
             if (next) _order.Insert(Math.Min(_order.Count, _orderPos + 1), qi); else _order.Add(qi);
+            _queueDirty = true;
         }
 
         // ============================================================================ queue
@@ -720,6 +750,7 @@ namespace Spotipaq
             {
                 int current = _order[_orderPos];
                 BuildOrder(current);
+                _queueDirty = true;
             }
             RefreshBar();
         }
@@ -728,6 +759,7 @@ namespace Spotipaq
         {
             if (orderPos < 0 || orderPos >= _order.Count) return;
             _orderPos = orderPos;
+            _restored = null;
             _player.Play(_queue[_order[orderPos]], 0);
             RefreshAll();
         }
