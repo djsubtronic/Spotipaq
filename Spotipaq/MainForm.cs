@@ -761,7 +761,7 @@ namespace Spotipaq
             _bar.RepeatMode = _repeatMode;
             if (!_bar.DraggingVolume) _bar.Volume = _player.Volume;
             _bar.Invalidate();
-            string title = t == null ? "Spotipaq" : t.Name + " - " + t.ArtistName;
+            string title = t == null ? "Spotipaq" : t.ArtistName + " - " + t.Name;
             if (Text != title) Text = title;
         }
 
