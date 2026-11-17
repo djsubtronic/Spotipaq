@@ -396,6 +396,8 @@ namespace Spotipaq
         public event EventHandler PlayPause, Next, Previous, ShuffleToggled, RepeatToggled;
         public event EventHandler<SeekEventArgs> SeekRequested;
         public event EventHandler<NavEventArgs> LinkClicked;
+        public event EventHandler TrackContext;                  // right-click on the song title
+        public event EventHandler<NavEventArgs> LinkContext;     // right-click on the artist name
         public event EventHandler VolumeChanged;
 
         public Track Track;
@@ -609,6 +611,15 @@ namespace Spotipaq
                 Invalidate(); return;
             }
             if (_dragVol) { _dragVol = false; Capture = false; Invalidate(); return; }
+            if (e.Button == MouseButtons.Right && Track != null)
+            {
+                string rh = HitAt(e.Location);
+                if (rh == "title") Fire(TrackContext);
+                else if (rh == "artist" && LinkContext != null && !String.IsNullOrEmpty(Track.ArtistId))
+                    LinkContext(this, new NavEventArgs(new NavTarget(PageKind.Artist, Track.ArtistId)));
+                base.OnMouseUp(e);
+                return;
+            }
             if (e.Button != MouseButtons.Left) return;
             switch (HitAt(e.Location))
             {

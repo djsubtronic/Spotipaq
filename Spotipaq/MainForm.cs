@@ -93,6 +93,8 @@ namespace Spotipaq
             _bar.RepeatToggled += delegate { _repeatMode = (_repeatMode + 1) % 3; RefreshBar(); SaveSettings(false); };
             _bar.SeekRequested += delegate (object s, SeekEventArgs e) { if (_player.Current != null) _player.Seek(e.Ms); RefreshBar(); };
             _bar.LinkClicked += delegate (object s, NavEventArgs e) { Navigate(e.Target); };
+            _bar.TrackContext += delegate { ShowNowPlayingMenu(); };
+            _bar.LinkContext += delegate (object s, NavEventArgs e) { ShowNavMenu(e.Target); };
             _bar.VolumeChanged += delegate { _player.Volume = _bar.Volume; _volumeDirty = true; };
             _player.StateChanged += delegate { SafeUi(RefreshAll); };
             _player.TrackEnded += delegate
@@ -607,9 +609,37 @@ namespace Spotipaq
         public void ShowTrackMenu(List<Track> list, int index)
         {
             if (list == null || index < 0 || index >= list.Count) return;
-            Track t = list[index];
+            NavTarget curPage = Current;
+            ShowTrackMenu(list[index], delegate { PlayList(list, index); }, curPage != null && curPage.Kind == PageKind.Songs);
+        }
+
+        /// <summary>Right-click on the song title in the now-playing bar: same menu as a song row.
+        /// "Play" restarts the current song without touching the queue.</summary>
+        void ShowNowPlayingMenu()
+        {
+            Track t = _bar.Track;
+            if (t == null || String.IsNullOrEmpty(t.Id)) return;
+            NavTarget curPage = Current;
+            ShowTrackMenu(t, delegate
+            {
+                if (_player.Current != null)
+                {
+                    _player.Seek(0);
+                    if (_player.State == PlayState.Paused) _player.Resume();
+                }
+                else if (_restored != null)
+                {
+                    _restoredPos = 0;
+                    TogglePlayPause();
+                }
+                RefreshBar();
+            }, curPage != null && curPage.Kind == PageKind.Songs);
+        }
+
+        void ShowTrackMenu(Track t, EventHandler play, bool liked)
+        {
             ContextMenuStrip m = NewMenu();
-            m.Items.Add("Play", null, delegate { PlayList(list, index); });
+            m.Items.Add("Play", null, play);
             m.Items.Add("Play next", null, delegate { QueueTrack(t, true); });
             m.Items.Add("Add to queue", null, delegate { QueueTrack(t, false); });
             m.Items.Add(new ToolStripSeparator());
@@ -617,8 +647,7 @@ namespace Spotipaq
             if (!String.IsNullOrEmpty(t.ArtistId)) { string id = t.ArtistId; m.Items.Add("Go to artist", null, delegate { Navigate(new NavTarget(PageKind.Artist, id)); }); }
             if (!String.IsNullOrEmpty(t.AlbumId)) { string id = t.AlbumId; m.Items.Add("Go to album", null, delegate { Navigate(new NavTarget(PageKind.Album, id)); }); }
             m.Items.Add(new ToolStripSeparator());
-            NavTarget curPage = Current;
-            if (curPage != null && curPage.Kind == PageKind.Songs)
+            if (liked)
                 m.Items.Add("Remove from Liked Songs", null, delegate { SetSavedAsync("spotify:track:" + t.Id, false, null); });
             else
                 m.Items.Add("Save to Liked Songs", null, delegate { SetSavedAsync("spotify:track:" + t.Id, true, null); });
