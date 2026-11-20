@@ -232,13 +232,18 @@ namespace Spotipaq
         }
         [System.Runtime.InteropServices.DllImport("user32.dll")] static extern IntPtr CreatePopupMenu();
         [System.Runtime.InteropServices.DllImport("user32.dll")] static extern bool DestroyMenu(IntPtr menu);
+        [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+        struct MENUINFO { public int cbSize, fMask, dwStyle, cyMax; public IntPtr hbrBack; public int dwContextHelpID; public IntPtr dwMenuData; }
+        [System.Runtime.InteropServices.DllImport("user32.dll")] static extern bool SetMenuInfo(IntPtr menu, ref MENUINFO info);
         [System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)] static extern bool InsertMenuItemW(IntPtr menu, int item, bool byPosition, ref MENUITEMINFO info);
         [System.Runtime.InteropServices.DllImport("user32.dll")] static extern bool SetMenuDefaultItem(IntPtr menu, int item, int byPosition);
         [System.Runtime.InteropServices.DllImport("user32.dll")] static extern int TrackPopupMenu(IntPtr menu, int flags, int x, int y, int reserved, IntPtr hWnd, IntPtr rect);
         [System.Runtime.InteropServices.DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr hWnd);
         [System.Runtime.InteropServices.DllImport("user32.dll")] static extern bool ShowWindow(IntPtr hWnd, int cmd);
 
-        // glyph: one of Windows' own system-menu pictures (HBMMENU_POPUP_CLOSE 8, RESTORE 9, MAXIMIZE 10, MINIMIZE 11), or 0
+        // glyph: one of Windows' own system-menu pictures (HBMMENU_POPUP_CLOSE 8, RESTORE 9, MAXIMIZE 10, MINIMIZE 11),
+        // GlyphOurs for one we draw ourselves in that same column (WM_MEASUREITEM / WM_DRAWITEM below), or 0 for none
+        const int GlyphOurs = -1;                             // HBMMENU_CALLBACK
         static void AddMenuItem(IntPtr menu, int id, string text, bool enabled, int glyph)
         {
             MENUITEMINFO mi = new MENUITEMINFO();
@@ -249,6 +254,89 @@ namespace Spotipaq
             mi.fState = enabled ? 0 : 0x3;                    // MFS_GRAYED
             if (glyph != 0) { mi.fMask |= 0x80; mi.hbmpItem = (IntPtr)glyph; }      // MIIM_BITMAP
             InsertMenuItemW(menu, -1, true, ref mi);
+        }
+
+        // ---- playback glyphs for the window menu: the now-playing bar's shapes (previous, play, pause, next) as pixel
+        // grids at the system's menu-glyph size. Windows asks us to draw them (in the column its own restore / minimize
+        // glyphs use), so we can paint them in the menu's current text colour: normal, highlighted or greyed.
+        [System.Runtime.InteropServices.DllImport("user32.dll")] static extern int GetSystemMetrics(int index);
+        static readonly bool[][,] _menuMarks = new bool[4][,];      // 0 previous, 1 play, 2 pause, 3 next
+        int _menuPlayKind = 1;                                       // what the Play / Pause entry shows in the open menu
+
+        static bool[,] MenuMark(int kind)
+        {
+            if (_menuMarks[kind] != null) return _menuMarks[kind];
+            int w = Math.Max(11, GetSystemMetrics(71)), h = Math.Max(11, GetSystemMetrics(72));       // SM_CXMENUCHECK / SM_CYMENUCHECK
+            int cx = w / 2, cy = h / 2;
+            bool[,] on = new bool[w, h];
+            for (int dy = -4; dy <= 4; dy++)
+            {
+                int y = cy + dy, a = Math.Abs(dy);
+                if (y < 0 || y >= h) continue;
+                switch (kind)
+                {
+                    case 1:                                              // play: triangle, one pixel narrower per row (exact 1:1 slopes)
+                        for (int i = 0; i < 5 - a; i++) Set(on, cx - 2 + i, y);
+                        break;
+                    case 2:                                              // pause: two bars
+                        Set(on, cx - 3, y); Set(on, cx - 2, y); Set(on, cx + 1, y); Set(on, cx + 2, y);
+                        break;
+                    case 3:                                              // next: triangle then a bar
+                        for (int i = 0; i < 5 - a; i++) Set(on, cx - 3 + i, y);
+                        Set(on, cx + 2, y); Set(on, cx + 3, y);
+                        break;
+                    default:                                             // previous: a bar then a triangle (next, mirrored)
+                        for (int i = 0; i < 5 - a; i++) Set(on, cx + 3 - i, y);
+                        Set(on, cx - 2, y); Set(on, cx - 3, y);
+                        break;
+                }
+            }
+            return _menuMarks[kind] = on;
+        }
+        static void Set(bool[,] on, int x, int y) { if (x >= 0 && x < on.GetLength(0) && y >= 0 && y < on.GetLength(1)) on[x, y] = true; }
+
+        bool[,] MarkForCommand(int id)
+        {
+            switch (id)
+            {
+                case CmdPrevious: return MenuMark(0);
+                case CmdPlayPause: return MenuMark(_menuPlayKind);
+                case CmdNext: return MenuMark(3);
+            }
+            return null;
+        }
+
+        /// <summary>WM_MEASUREITEM / WM_DRAWITEM for our glyphs in the window menu. True when handled.</summary>
+        bool MenuGlyphMessage(ref Message m)
+        {
+            if (System.Runtime.InteropServices.Marshal.ReadInt32(m.LParam, 0) != 1) return false;      // ODT_MENU
+            bool[,] mark = MarkForCommand(System.Runtime.InteropServices.Marshal.ReadInt32(m.LParam, 8));
+            if (mark == null) return false;
+            int w = mark.GetLength(0), h = mark.GetLength(1);
+            if (m.Msg == 0x002C)                               // WM_MEASUREITEM: itemWidth, itemHeight
+            {
+                System.Runtime.InteropServices.Marshal.WriteInt32(m.LParam, 12, w);
+                System.Runtime.InteropServices.Marshal.WriteInt32(m.LParam, 16, h);
+            }
+            else                                               // WM_DRAWITEM
+            {
+                int state = System.Runtime.InteropServices.Marshal.ReadInt32(m.LParam, 16);
+                int dcAt = IntPtr.Size == 8 ? 32 : 24, rcAt = dcAt + IntPtr.Size;
+                IntPtr dc = System.Runtime.InteropServices.Marshal.ReadIntPtr(m.LParam, dcAt);
+                int left = System.Runtime.InteropServices.Marshal.ReadInt32(m.LParam, rcAt), top = System.Runtime.InteropServices.Marshal.ReadInt32(m.LParam, rcAt + 4);
+                int right = System.Runtime.InteropServices.Marshal.ReadInt32(m.LParam, rcAt + 8), bottom = System.Runtime.InteropServices.Marshal.ReadInt32(m.LParam, rcAt + 12);
+                Color c = (state & 0x6) != 0 ? SystemColors.GrayText                     // ODS_GRAYED | ODS_DISABLED
+                        : (state & 0x1) != 0 ? SystemColors.HighlightText                // ODS_SELECTED
+                        : SystemColors.MenuText;
+                int ox = left + (right - left - w) / 2, oy = top + (bottom - top - h) / 2;
+                using (Graphics g = Graphics.FromHdc(dc))
+                using (SolidBrush b = new SolidBrush(c))
+                    for (int y = 0; y < h; y++)
+                        for (int x = 0; x < w; x++)
+                            if (mark[x, y]) g.FillRectangle(b, ox + x, oy + y, 1, 1);
+            }
+            m.Result = (IntPtr)1;
+            return true;
         }
         static void AddMenuSeparator(IntPtr menu)
         {
@@ -290,9 +378,17 @@ namespace Spotipaq
             if (menu == IntPtr.Zero) return;
             try
             {
-                AddMenuItem(menu, CmdPrevious, "Pre&vious", anything, 0);
-                AddMenuItem(menu, CmdPlayPause, IsPlaying ? "&Pause" : "&Play", anything, 0);
-                AddMenuItem(menu, CmdNext, "Ne&xt", anything, 0);
+                // One shared column for check marks and glyphs, as real system menus have (MNS_CHECKORBMP): without it
+                // Windows keeps an empty check-mark column to the left of the glyphs once an item draws its own.
+                MENUINFO info = new MENUINFO();
+                info.cbSize = System.Runtime.InteropServices.Marshal.SizeOf(typeof(MENUINFO));
+                info.fMask = 0x10;                            // MIM_STYLE
+                info.dwStyle = 0x04000000;                    // MNS_CHECKORBMP
+                SetMenuInfo(menu, ref info);
+                _menuPlayKind = IsPlaying ? 2 : 1;
+                AddMenuItem(menu, CmdPrevious, "Pre&vious", anything, GlyphOurs);
+                AddMenuItem(menu, CmdPlayPause, IsPlaying ? "&Pause" : "&Play", anything, GlyphOurs);
+                AddMenuItem(menu, CmdNext, "Ne&xt", anything, GlyphOurs);
                 AddMenuSeparator(menu);
                 AddMenuItem(menu, SC_RESTORE, "&Restore", min || max, 9);
                 AddMenuItem(menu, SC_MOVE, "&Move", normal, 0);
@@ -337,6 +433,7 @@ namespace Spotipaq
                 int which = m.WParam.ToInt32() - HotkeyBase;
                 if (which >= 0 && which < MediaVk.Length) { OnMediaKey(which); return; }
             }
+            if ((m.Msg == 0x002C || m.Msg == 0x002B) && m.LParam != IntPtr.Zero && MenuGlyphMessage(ref m)) return;   // our menu glyphs
             if (m.Msg == WM_SYSMENU)                 // the taskbar button was right-clicked
             {
                 int pos = unchecked((int)(long)m.LParam);
