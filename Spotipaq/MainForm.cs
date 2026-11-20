@@ -11,6 +11,7 @@ namespace Spotipaq
         readonly ISpotifyBackend _backend;
         readonly IPlayback _player;
         readonly ImageCache _images;
+        readonly TitleBar _title;
         readonly TopBar _top = new TopBar();
         readonly Sidebar _sidebar = new Sidebar();
         readonly NowPlayingBar _bar = new NowPlayingBar();
@@ -49,6 +50,8 @@ namespace Spotipaq
             _backend = backend;
             _player = player;
             Text = "Spotipaq";
+            FormBorderStyle = FormBorderStyle.None;            // own title bar (TitleBar); edges still resize, see WndProc
+            Padding = new Padding(FrameW);                     // the strip the form itself owns: resize hit-testing
             BackColor = Theme.Main;
             ForeColor = Theme.Text;
             Font = Theme.Normal;
@@ -58,6 +61,9 @@ namespace Spotipaq
             KeyPreview = true;
             try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
             RestoreWindow();
+            MaximizedBounds = Screen.FromRectangle(Bounds).WorkingArea;      // a borderless form would otherwise cover the taskbar
+            _title = new TitleBar(this);
+            _title.MenuRequested += delegate (object s, MouseEventArgs e) { ShowWindowMenu(new Point(e.X, e.Y)); };
             _shuffle = _settings.GetBool("shuffle", false);
             int savedRepeat = _settings.GetInt("repeatMode", -1);
             _repeatMode = savedRepeat >= 0 ? Math.Max(RepeatOff, Math.Min(RepeatOne, savedRepeat))
@@ -74,7 +80,7 @@ namespace Spotipaq
             _bar.Dock = DockStyle.Bottom;
             _page.Dock = DockStyle.Fill;
             _bar.Images = _images;
-            Controls.Add(_page); Controls.Add(_sidebar); Controls.Add(_top); Controls.Add(_bar);   // z-order: fill added first
+            Controls.Add(_page); Controls.Add(_sidebar); Controls.Add(_top); Controls.Add(_bar); Controls.Add(_title);   // z-order: fill added first, title bar docks first
 
             _images.Loaded += delegate { _page.Invalidate(); _bar.Invalidate(); };
             _sidebar.ItemClicked += delegate (object s, NavEventArgs e) { Navigate(e.Target); };
@@ -139,6 +145,12 @@ namespace Spotipaq
         [System.Runtime.InteropServices.DllImport("user32.dll")] static extern IntPtr SendMessage(IntPtr h, int msg, IntPtr w, IntPtr l);
         public bool PreFilterMessage(ref Message m)
         {
+            // The owner-drawn bars never take the keyboard focus, so a click on them would leave it in the search box:
+            // hand it to the page instead (clicks on the search box's own outline / lens keep it).
+            if ((m.Msg == 0x0201 || m.Msg == 0x0204) && _top.SearchBox.Focused &&            // WM_LBUTTONDOWN / WM_RBUTTONDOWN
+                (m.HWnd == _title.Handle || m.HWnd == _sidebar.Handle || m.HWnd == _bar.Handle ||
+                 (m.HWnd == _top.Handle && !_top.SearchFrame.Contains(_top.PointToClient(Cursor.Position)))))
+                _page.Focus();
             if (m.Msg != 0x020A) return false;                 // WM_MOUSEWHEEL
             IntPtr under = WindowFromPoint(Cursor.Position);
             if (under == IntPtr.Zero || under == m.HWnd) return false;
@@ -202,16 +214,154 @@ namespace Spotipaq
             }
         }
 
-        // WinForms re-sends its own (shrunken) small icon now and then; always answer with the 16x16 frame AppIcon picked
+        // ---- borderless window: styles, edge resizing, frame, and the window (taskbar) menu
+        const int FrameW = 3;
+        const int WM_NCHITTEST = 0x0084, WM_SYSMENU = 0x0313, WM_SYSCOMMAND = 0x0112;
+        const int HTCLIENT = 1, HTLEFT = 10, HTRIGHT = 11, HTTOP = 12, HTTOPLEFT = 13, HTTOPRIGHT = 14, HTBOTTOM = 15, HTBOTTOMLEFT = 16, HTBOTTOMRIGHT = 17;
+        const int SC_SIZE = 0xF000, SC_MOVE = 0xF010, SC_MINIMIZE = 0xF020, SC_MAXIMIZE = 0xF030, SC_CLOSE = 0xF060, SC_RESTORE = 0xF120;
+        const int CmdPrevious = 1, CmdPlayPause = 2, CmdNext = 3;
+
+        [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential, CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+        struct MENUITEMINFO
+        {
+            public int cbSize, fMask, fType, fState, wID;
+            public IntPtr hSubMenu, hbmpChecked, hbmpUnchecked, dwItemData;
+            public string dwTypeData;
+            public int cch;
+            public IntPtr hbmpItem;
+        }
+        [System.Runtime.InteropServices.DllImport("user32.dll")] static extern IntPtr CreatePopupMenu();
+        [System.Runtime.InteropServices.DllImport("user32.dll")] static extern bool DestroyMenu(IntPtr menu);
+        [System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)] static extern bool InsertMenuItemW(IntPtr menu, int item, bool byPosition, ref MENUITEMINFO info);
+        [System.Runtime.InteropServices.DllImport("user32.dll")] static extern bool SetMenuDefaultItem(IntPtr menu, int item, int byPosition);
+        [System.Runtime.InteropServices.DllImport("user32.dll")] static extern int TrackPopupMenu(IntPtr menu, int flags, int x, int y, int reserved, IntPtr hWnd, IntPtr rect);
+        [System.Runtime.InteropServices.DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr hWnd);
+        [System.Runtime.InteropServices.DllImport("user32.dll")] static extern bool ShowWindow(IntPtr hWnd, int cmd);
+
+        // glyph: one of Windows' own system-menu pictures (HBMMENU_POPUP_CLOSE 8, RESTORE 9, MAXIMIZE 10, MINIMIZE 11), or 0
+        static void AddMenuItem(IntPtr menu, int id, string text, bool enabled, int glyph)
+        {
+            MENUITEMINFO mi = new MENUITEMINFO();
+            mi.cbSize = System.Runtime.InteropServices.Marshal.SizeOf(typeof(MENUITEMINFO));
+            mi.fMask = 0x2 | 0x40 | 0x1;                      // MIIM_ID | MIIM_STRING | MIIM_STATE
+            mi.wID = id;
+            mi.dwTypeData = text;
+            mi.fState = enabled ? 0 : 0x3;                    // MFS_GRAYED
+            if (glyph != 0) { mi.fMask |= 0x80; mi.hbmpItem = (IntPtr)glyph; }      // MIIM_BITMAP
+            InsertMenuItemW(menu, -1, true, ref mi);
+        }
+        static void AddMenuSeparator(IntPtr menu)
+        {
+            MENUITEMINFO mi = new MENUITEMINFO();
+            mi.cbSize = System.Runtime.InteropServices.Marshal.SizeOf(typeof(MENUITEMINFO));
+            mi.fMask = 0x100;                                 // MIIM_FTYPE
+            mi.fType = 0x800;                                 // MFT_SEPARATOR
+            InsertMenuItemW(menu, -1, true, ref mi);
+        }
+
+        protected override CreateParams CreateParams
+        {
+            get
+            {
+                CreateParams cp = base.CreateParams;
+                cp.Style |= 0x00020000;          // WS_MINIMIZEBOX: lets a taskbar click minimise a borderless window
+                cp.ExStyle |= 0x00040000;        // WS_EX_APPWINDOW
+                return cp;
+            }
+        }
+
+        // the frame strip around the content (the children cover everything else)
+        protected override void OnPaintBackground(PaintEventArgs e)
+        {
+            using (SolidBrush b = new SolidBrush(TitleBar.BarColor)) e.Graphics.FillRectangle(b, ClientRectangle);
+        }
+
+        // The window menu: on a right-click of the taskbar button (WM_SYSMENU) or of the title bar. A borderless form
+        // has no system menu for Windows to show, and giving it one (WS_SYSMENU) would break the edge resizing, so the
+        // request is answered with a native menu of our own that mirrors the standard one - same entries, same order,
+        // Windows' own glyphs - with the playback commands on top.
+        void ShowWindowMenu(Point screen)
+        {
+            bool min = WindowState == FormWindowState.Minimized;
+            bool max = WindowState == FormWindowState.Maximized;
+            bool normal = !min && !max;
+            bool anything = _player.Current != null || _restored != null || _queue.Count > 0;
+            IntPtr menu = CreatePopupMenu();
+            if (menu == IntPtr.Zero) return;
+            try
+            {
+                AddMenuItem(menu, CmdPrevious, "Pre&vious", anything, 0);
+                AddMenuItem(menu, CmdPlayPause, IsPlaying ? "&Pause" : "&Play", anything, 0);
+                AddMenuItem(menu, CmdNext, "Ne&xt", anything, 0);
+                AddMenuSeparator(menu);
+                AddMenuItem(menu, SC_RESTORE, "&Restore", min || max, 9);
+                AddMenuItem(menu, SC_MOVE, "&Move", normal, 0);
+                AddMenuItem(menu, SC_SIZE, "&Size", normal, 0);
+                AddMenuItem(menu, SC_MINIMIZE, "Mi&nimize", !min, 11);
+                AddMenuItem(menu, SC_MAXIMIZE, "Ma&ximize", !max, 10);
+                AddMenuSeparator(menu);
+                AddMenuItem(menu, SC_CLOSE, "&Close\tAlt+F4", true, 8);
+                SetMenuDefaultItem(menu, min ? SC_RESTORE : SC_CLOSE, 0);       // Windows shows the default entry in bold
+                SetForegroundWindow(Handle);                                    // else the menu won't close on a click elsewhere
+                int cmd = TrackPopupMenu(menu, 0x2 | 0x100, screen.X, screen.Y, 0, Handle, IntPtr.Zero);     // TPM_RIGHTBUTTON | TPM_RETURNCMD
+                switch (cmd)
+                {
+                    case CmdPrevious: Previous(); break;
+                    case CmdPlayPause: TogglePlayPause(); break;
+                    case CmdNext: Skip(1, true); break;
+                    case SC_RESTORE:
+                        if (WindowState == FormWindowState.Minimized) ShowWindow(Handle, 9);     // SW_RESTORE
+                        else if (WindowState == FormWindowState.Maximized) WindowState = FormWindowState.Normal;
+                        break;
+                    case SC_MOVE:
+                    case SC_SIZE:
+                        SendMessage(Handle, WM_SYSCOMMAND, (IntPtr)cmd, IntPtr.Zero);            // the standard keyboard move / size mode
+                        break;
+                    case SC_MINIMIZE: WindowState = FormWindowState.Minimized; break;
+                    case SC_MAXIMIZE:
+                        if (WindowState == FormWindowState.Minimized) ShowWindow(Handle, 9);
+                        if (WindowState != FormWindowState.Maximized) WindowState = FormWindowState.Maximized;
+                        break;
+                    case SC_CLOSE: Close(); break;
+                }
+            }
+            finally { DestroyMenu(menu); }
+        }
+
         protected override void WndProc(ref Message m)
         {
+            // WinForms re-sends its own (shrunken) small icon now and then; always answer with the 16x16 frame AppIcon picked
             if (m.Msg == 0x0080 && m.WParam == IntPtr.Zero && AppIcon.Small != IntPtr.Zero) m.LParam = AppIcon.Small;
             if (m.Msg == WM_HOTKEY)
             {
                 int which = m.WParam.ToInt32() - HotkeyBase;
                 if (which >= 0 && which < MediaVk.Length) { OnMediaKey(which); return; }
             }
+            if (m.Msg == WM_SYSMENU)                 // the taskbar button was right-clicked
+            {
+                int pos = unchecked((int)(long)m.LParam);
+                ShowWindowMenu(new Point((short)(pos & 0xFFFF), (short)((pos >> 16) & 0xFFFF)));
+                return;
+            }
             base.WndProc(ref m);
+            if (m.Msg == WM_NCHITTEST && (int)m.Result == HTCLIENT && WindowState == FormWindowState.Normal)
+            {
+                int lp = unchecked((int)(long)m.LParam);
+                Point pt = PointToClient(new Point((short)(lp & 0xFFFF), (short)((lp >> 16) & 0xFFFF)));
+                const int b = 6;
+                bool l = pt.X < b, r = pt.X >= ClientSize.Width - b;
+                bool t = pt.Y < b, bt = pt.Y >= ClientSize.Height - b;
+                int code = HTCLIENT;
+                if (t && l) code = HTTOPLEFT;
+                else if (t && r) code = HTTOPRIGHT;
+                else if (bt && l) code = HTBOTTOMLEFT;
+                else if (bt && r) code = HTBOTTOMRIGHT;
+                else if (l) code = HTLEFT;
+                else if (r) code = HTRIGHT;
+                else if (t) code = HTTOP;
+                else if (bt) code = HTBOTTOM;
+                if (code != HTCLIENT) m.Result = (IntPtr)code;
+            }
         }
 
         void RestoreWindow()
@@ -262,13 +412,18 @@ namespace Spotipaq
             if (!IsHandleCreated) return;
             if (WindowState == FormWindowState.Minimized) return;
             _lastMax = WindowState == FormWindowState.Maximized;
+            if (WindowState == FormWindowState.Normal) MaximizedBounds = Screen.FromControl(this).WorkingArea;   // where "maximize" goes from here
             Rectangle b = WindowState == FormWindowState.Normal ? Bounds : RestoreBounds;
             if (b.Width >= MinimumSize.Width && b.Height >= MinimumSize.Height) _lastNormal = b;
         }
 
         protected override void OnResize(EventArgs e)
         {
+            // no resize frame while maximized: the content goes right to the screen edges
+            Padding want = WindowState == FormWindowState.Maximized ? Padding.Empty : new Padding(FrameW);
+            if (Padding != want) Padding = want;
             base.OnResize(e);
+            if (_title != null) _title.Invalidate();           // maximize <-> restore glyph
             TrackWindow();
         }
 
@@ -350,9 +505,7 @@ namespace Spotipaq
 
         void BuildUserMenu()
         {
-            ContextMenuStrip m = new ContextMenuStrip();
-            m.ShowImageMargin = false;
-            m.Font = Theme.Normal;
+            ContextMenuStrip m = Menus.New();
             m.Items.Add("Open log file", null, delegate
             {
                 Engine.Log.Flush();
@@ -587,10 +740,7 @@ namespace Spotipaq
         // ============================================================================ context menus
         static ContextMenuStrip NewMenu()
         {
-            ContextMenuStrip m = new ContextMenuStrip();
-            m.ShowImageMargin = false;
-            m.Font = Theme.Normal;
-            return m;
+            return Menus.New();
         }
 
         static void CopyText(string s) { try { Clipboard.SetText(s); } catch { } }

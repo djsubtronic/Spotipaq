@@ -100,6 +100,7 @@ namespace Spotipaq
             t.BorderStyle = BorderStyle.FixedSingle;
             t.BackColor = Color.FromArgb(18, 18, 18);
             t.ForeColor = Color.White;
+            Menus.ForTextBox(t);              // dark right-click menu
         }
 
         protected override void OnLoad(EventArgs e)
@@ -296,6 +297,7 @@ namespace Spotipaq
             t.BorderStyle = BorderStyle.FixedSingle;
             t.BackColor = Color.FromArgb(18, 18, 18);
             t.ForeColor = Color.White;
+            Menus.ForTextBox(t);              // dark right-click menu
         }
 
         protected override void OnShown(EventArgs e) { base.OnShown(e); Scan(); }

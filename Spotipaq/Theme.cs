@@ -492,6 +492,96 @@ namespace Spotipaq
         }
     }
 
+    /// <summary>Dark look for every ContextMenuStrip in the app (set once as ToolStripManager.Renderer).</summary>
+    public sealed class DarkMenuRenderer : ToolStripRenderer
+    {
+        public static readonly Color Back = Color.FromArgb(40, 40, 40);
+        static readonly Color Border = Color.FromArgb(70, 70, 70), Hot = Color.FromArgb(64, 64, 64), Sep = Color.FromArgb(62, 62, 62);
+        static readonly Color ItemText = Color.FromArgb(215, 215, 215);
+
+        protected override void OnRenderToolStripBackground(ToolStripRenderEventArgs e)
+        {
+            using (SolidBrush b = new SolidBrush(Back)) e.Graphics.FillRectangle(b, e.AffectedBounds);
+        }
+        protected override void OnRenderToolStripBorder(ToolStripRenderEventArgs e)
+        {
+            using (Pen p = new Pen(Border)) e.Graphics.DrawRectangle(p, 0, 0, e.ToolStrip.Width - 1, e.ToolStrip.Height - 1);
+        }
+        protected override void OnRenderImageMargin(ToolStripRenderEventArgs e) { }
+        protected override void OnRenderMenuItemBackground(ToolStripItemRenderEventArgs e)
+        {
+            if (!e.Item.Selected || !e.Item.Enabled) return;
+            using (SolidBrush b = new SolidBrush(Hot)) e.Graphics.FillRectangle(b, 2, 0, e.Item.Width - 4, e.Item.Height);
+        }
+        protected override void OnRenderItemText(ToolStripItemTextRenderEventArgs e)
+        {
+            Color c = !e.Item.Enabled ? Theme.DimText : e.Item.Selected ? Color.White : ItemText;
+            TextRenderer.DrawText(e.Graphics, e.Text, e.TextFont, e.TextRectangle, c, e.TextFormat);
+        }
+        protected override void OnRenderSeparator(ToolStripSeparatorRenderEventArgs e)
+        {
+            int y = e.Item.Height / 2;
+            using (Pen p = new Pen(Sep)) e.Graphics.DrawLine(p, 8, y, e.Item.Width - 9, y);
+        }
+        protected override void OnRenderArrow(ToolStripArrowRenderEventArgs e)
+        {
+            e.ArrowColor = e.Item != null && e.Item.Selected ? Color.White : ItemText;
+            base.OnRenderArrow(e);
+        }
+        protected override void OnRenderItemCheck(ToolStripItemImageRenderEventArgs e)
+        {
+            Rectangle r = e.ImageRectangle;
+            int cx = r.Left + r.Width / 2, cy = r.Top + r.Height / 2;
+            SmoothingMode old = e.Graphics.SmoothingMode;
+            e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            using (Pen p = new Pen(Theme.Accent, 1.8f))
+                e.Graphics.DrawLines(p, new Point[] { new Point(cx - 4, cy), new Point(cx - 1, cy + 3), new Point(cx + 4, cy - 3) });
+            e.Graphics.SmoothingMode = old;
+        }
+    }
+
+    public static class Menus
+    {
+        static bool _installed;
+
+        /// <summary>A dark context menu. Also makes the dark renderer the app-wide default the first time.</summary>
+        public static ContextMenuStrip New()
+        {
+            if (!_installed) { _installed = true; ToolStripManager.Renderer = new DarkMenuRenderer(); }
+            ContextMenuStrip m = new ContextMenuStrip();
+            m.ShowImageMargin = false;
+            m.Font = Theme.Normal;
+            m.BackColor = DarkMenuRenderer.Back;
+            m.ForeColor = Theme.Text;
+            return m;
+        }
+
+        /// <summary>Replaces a text box's (light, system-drawn) right-click menu with a dark one offering the same commands.</summary>
+        public static void ForTextBox(TextBox box)
+        {
+            ContextMenuStrip m = New();
+            ToolStripItem undo = m.Items.Add("Undo", null, delegate { box.Undo(); });
+            m.Items.Add(new ToolStripSeparator());
+            ToolStripItem cut = m.Items.Add("Cut", null, delegate { box.Cut(); });
+            ToolStripItem copy = m.Items.Add("Copy", null, delegate { box.Copy(); });
+            ToolStripItem paste = m.Items.Add("Paste", null, delegate { box.Paste(); });
+            ToolStripItem del = m.Items.Add("Delete", null, delegate { box.SelectedText = ""; });
+            m.Items.Add(new ToolStripSeparator());
+            ToolStripItem all = m.Items.Add("Select All", null, delegate { box.SelectAll(); });
+            m.Opening += delegate
+            {
+                if (!box.Focused) box.Focus();
+                bool sel = box.SelectionLength > 0, canPaste = false;
+                try { canPaste = Clipboard.ContainsText(); } catch { }
+                undo.Enabled = box.CanUndo;
+                cut.Enabled = sel; copy.Enabled = sel; del.Enabled = sel;
+                paste.Enabled = canPaste;
+                all.Enabled = box.TextLength > 0 && box.SelectionLength < box.TextLength;
+            };
+            box.ContextMenuStrip = m;
+        }
+    }
+
     /// <summary>Gives the window its proper small (16px) and large icon straight from the exe, so XP doesn't rescale one size.</summary>
     public static class AppIcon
     {

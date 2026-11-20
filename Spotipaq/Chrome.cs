@@ -9,6 +9,136 @@ using System.Windows.Forms;
 namespace Spotipaq
 {
     // ------------------------------------------------------------------------------------------------
+    // Title bar of the borderless window: icon + title on the left, minimize / maximize / close on the right,
+    // drag to move (not while maximized), double-click to maximize / restore, right-click for the window menu.
+    // ------------------------------------------------------------------------------------------------
+    public sealed class TitleBar : Control
+    {
+        [System.Runtime.InteropServices.DllImport("user32.dll")] static extern bool ReleaseCapture();
+        [System.Runtime.InteropServices.DllImport("user32.dll")] static extern IntPtr SendMessage(IntPtr h, int msg, IntPtr w, IntPtr l);
+        [System.Runtime.InteropServices.DllImport("user32.dll")] static extern bool DrawIconEx(IntPtr hdc, int x, int y, IntPtr icon, int w, int h, int step, IntPtr brush, int flags);
+
+        public static readonly Color BarColor = Color.FromArgb(18, 18, 18);
+        static readonly Color TitleColor = Color.FromArgb(0xeb, 0xeb, 0xeb);
+        static readonly Color CloseHot = Color.FromArgb(0xda, 0x37, 0x3c);
+        /// <summary>Right-click on the bar; carries the screen position for the window menu.</summary>
+        public event EventHandler<MouseEventArgs> MenuRequested;
+        readonly Form _form;
+        int _hot = -1, _pressed = -1;
+        const int BtnW = 26;                  // buttons 26 x 24: the old 24 x 22 scaled with the bar
+        const int TextH = 22;                 // icon and title stay centred in the top 22 px
+
+        public TitleBar(Form form)
+        {
+            _form = form;
+            _form.TextChanged += delegate { Invalidate(); };      // the title follows the window text (artist - song)
+            Height = 24;
+            Dock = DockStyle.Top;
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer |
+                     ControlStyles.ResizeRedraw | ControlStyles.Opaque, true);
+        }
+
+        Rectangle BtnRect(int i) { return new Rectangle(Width - (3 - i) * BtnW, 0, BtnW, Height); }
+        int BtnAt(int x, int y) { for (int i = 0; i < 3; i++) if (BtnRect(i).Contains(x, y)) return i; return -1; }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            Graphics g = e.Graphics;
+            using (SolidBrush b = new SolidBrush(BarColor)) g.FillRectangle(b, ClientRectangle);
+
+            int textX = 8;
+            if (AppIcon.Small != IntPtr.Zero)
+            {
+                IntPtr dc = g.GetHdc();
+                try { DrawIconEx(dc, 6, (TextH - 16) / 2, AppIcon.Small, 16, 16, 0, IntPtr.Zero, 3); }      // DI_NORMAL
+                finally { g.ReleaseHdc(dc); }
+                textX = 28;
+            }
+            Theme.Draw(g, _form.Text, Theme.Normal, new Rectangle(textX, 0, Math.Max(10, Width - textX - 3 * BtnW - 8), TextH), TitleColor, Theme.LeftEllipsis);
+
+            for (int i = 0; i < 3; i++)
+            {
+                Rectangle r = BtnRect(i);
+                bool hot = _hot == i && (_pressed == -1 || _pressed == i);
+                if (hot) using (SolidBrush b = new SolidBrush(i == 2 ? CloseHot : Theme.RowHover)) g.FillRectangle(b, r);
+                int cx = r.X + r.Width / 2, cy = r.Y + r.Height / 2;
+                using (Pen p = new Pen(hot && i == 2 ? Color.White : Theme.Text, 1f))
+                {
+                    if (i == 0) g.DrawLine(p, cx - 3, cy + 2, cx + 3, cy + 2);
+                    else if (i == 1)
+                    {
+                        if (_form.WindowState == FormWindowState.Maximized)
+                        {
+                            g.DrawRectangle(p, cx - 3, cy - 1, 4, 4);
+                            g.DrawLines(p, new Point[] { new Point(cx - 1, cy - 1), new Point(cx - 1, cy - 3), new Point(cx + 3, cy - 3), new Point(cx + 3, cy + 1), new Point(cx + 1, cy + 1) });
+                        }
+                        else g.DrawRectangle(p, cx - 3, cy - 3, 6, 6);
+                    }
+                    else
+                    {
+                        g.DrawLine(p, cx - 3, cy - 3, cx + 3, cy + 3);
+                        g.DrawLine(p, cx - 3, cy + 3, cx + 3, cy - 3);
+                    }
+                }
+            }
+        }
+
+        protected override void OnMouseMove(MouseEventArgs e)
+        {
+            base.OnMouseMove(e);
+            int h = BtnAt(e.X, e.Y);
+            if (h != _hot) { _hot = h; Invalidate(); }
+        }
+
+        protected override void OnMouseLeave(EventArgs e)
+        {
+            base.OnMouseLeave(e);
+            if (_hot != -1) { _hot = -1; Invalidate(); }
+        }
+
+        void ToggleMax()
+        {
+            _form.WindowState = _form.WindowState == FormWindowState.Maximized ? FormWindowState.Normal : FormWindowState.Maximized;
+        }
+
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            base.OnMouseDown(e);
+            if (e.Button != MouseButtons.Left) return;
+            int b = BtnAt(e.X, e.Y);
+            if (b >= 0) { _pressed = b; Invalidate(); }          // acts on mouse up, if still over the same button
+            else if (e.Clicks == 2) ToggleMax();
+            else if (_form.WindowState != FormWindowState.Maximized)      // a maximized window stays put
+            {
+                ReleaseCapture();
+                SendMessage(_form.Handle, 0x00A1, (IntPtr)2, IntPtr.Zero);        // WM_NCLBUTTONDOWN, HTCAPTION
+            }
+        }
+
+        protected override void OnMouseUp(MouseEventArgs e)
+        {
+            base.OnMouseUp(e);
+            if (e.Button == MouseButtons.Right)
+            {
+                if (BtnAt(e.X, e.Y) < 0 && MenuRequested != null)
+                {
+                    Point s = PointToScreen(e.Location);
+                    MenuRequested(this, new MouseEventArgs(MouseButtons.Right, 1, s.X, s.Y, 0));
+                }
+                return;
+            }
+            if (e.Button != MouseButtons.Left || _pressed < 0) return;
+            int b = BtnAt(e.X, e.Y), was = _pressed;
+            _pressed = -1;
+            Invalidate();
+            if (b != was) return;
+            if (b == 0) _form.WindowState = FormWindowState.Minimized;
+            else if (b == 1) ToggleMax();
+            else _form.Close();
+        }
+    }
+
+    // ------------------------------------------------------------------------------------------------
     // Sidebar
     // ------------------------------------------------------------------------------------------------
     public sealed class SidebarItem
@@ -307,6 +437,17 @@ namespace Spotipaq
         string _user = "";
         int _hot;   // 1 back, 2 forward
         Rectangle _searchFrame;
+        // search box: dark like the bar, outlined; outline, lens and text brighten on hover / focus
+        static readonly Color SearchIdle = Color.FromArgb(80, 80, 80), SearchActive = Color.FromArgb(170, 170, 170);      // the seek bar's rail grey / its played part
+        /// <summary>The search box's outline, in this control's coordinates.</summary>
+        public Rectangle SearchFrame { get { return _searchFrame; } }
+        bool _searchHot;
+        bool SearchLit { get { return _searchHot || SearchBox.Focused; } }
+        void UpdateSearchHot()
+        {
+            bool over = IsHandleCreated && _searchFrame.Contains(PointToClient(Cursor.Position));
+            if (over != _searchHot) { _searchHot = over; Invalidate(); }
+        }
 
         public TopBar()
         {
@@ -314,9 +455,14 @@ namespace Spotipaq
             BackColor = Theme.Bar;
             Height = 50;
             SearchBox.BorderStyle = BorderStyle.None;
-            SearchBox.BackColor = Color.White;
-            SearchBox.ForeColor = Color.Black;
+            SearchBox.BackColor = Theme.Bar;
+            SearchBox.ForeColor = SearchActive;                 // text: light grey unfocused, white while typing
             SearchBox.Font = Theme.Normal;
+            SearchBox.GotFocus += delegate { SearchBox.ForeColor = Color.White; Invalidate(); };
+            SearchBox.LostFocus += delegate { SearchBox.ForeColor = SearchActive; Invalidate(); };
+            SearchBox.MouseEnter += delegate { UpdateSearchHot(); };
+            SearchBox.MouseLeave += delegate { UpdateSearchHot(); };
+            Menus.ForTextBox(SearchBox);
             SearchBox.KeyDown += delegate (object s, KeyEventArgs e)
             {
                 if (e.KeyCode == Keys.Enter && SearchBox.Text.Trim().Length > 0 && SearchRequested != null)
@@ -332,7 +478,7 @@ namespace Spotipaq
 
         protected override void OnLayout(LayoutEventArgs e)
         {
-            _searchFrame = new Rectangle(80, 12, Math.Min(260, Width - 260), 26);
+            _searchFrame = new Rectangle(80, 12, Math.Min(299, Width - 260), 26);
             int h = SearchBox.PreferredHeight;
             SearchBox.SetBounds(_searchFrame.Left + 26, _searchFrame.Top + (_searchFrame.Height - h) / 2, _searchFrame.Width - 36, h);
             base.OnLayout(e);
@@ -345,9 +491,10 @@ namespace Spotipaq
             g.SmoothingMode = SmoothingMode.AntiAlias;
             Chevron(g, 22, 25, true, CanBack, _hot == 1);
             Chevron(g, 52, 25, false, CanForward, _hot == 2);
-            using (GraphicsPath p = Theme.Pill(_searchFrame))
-            using (SolidBrush white = new SolidBrush(Color.White)) g.FillPath(white, p);
-            using (Pen lens = new Pen(Color.FromArgb(90, 90, 90), 1.6f))
+            Color sc = SearchLit ? SearchActive : SearchIdle;
+            using (GraphicsPath p = Theme.Pill(new Rectangle(_searchFrame.X, _searchFrame.Y, _searchFrame.Width - 1, _searchFrame.Height - 1)))
+            using (Pen edge = new Pen(sc, 1f)) g.DrawPath(edge, p);
+            using (Pen lens = new Pen(sc, 1.6f))
             {
                 g.DrawEllipse(lens, _searchFrame.Left + 9, _searchFrame.Top + 7, 9, 9);
                 g.DrawLine(lens, _searchFrame.Left + 17, _searchFrame.Top + 15, _searchFrame.Left + 21, _searchFrame.Top + 19);
@@ -370,8 +517,20 @@ namespace Spotipaq
         }
 
         int HitAt(Point p) { if (p.X >= 8 && p.X < 38) return 1; if (p.X >= 38 && p.X < 68) return 2; if (p.X >= Width - 190) return 3; return 0; }
-        protected override void OnMouseMove(MouseEventArgs e) { int h = HitAt(e.Location); if (h != _hot) { _hot = h; Invalidate(); } Cursor = h == 3 ? Cursors.Hand : Cursors.Default; base.OnMouseMove(e); }
-        protected override void OnMouseLeave(EventArgs e) { _hot = 0; Invalidate(); base.OnMouseLeave(e); }
+        protected override void OnMouseMove(MouseEventArgs e)
+        {
+            int h = HitAt(e.Location);
+            if (h != _hot) { _hot = h; Invalidate(); }
+            UpdateSearchHot();
+            Cursor = h == 3 ? Cursors.Hand : _searchHot ? Cursors.IBeam : Cursors.Default;
+            base.OnMouseMove(e);
+        }
+        protected override void OnMouseLeave(EventArgs e) { _hot = 0; UpdateSearchHot(); Invalidate(); base.OnMouseLeave(e); }
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            if (e.Button == MouseButtons.Left && _searchFrame.Contains(e.Location)) SearchBox.Focus();     // the lens / rim count as the box
+            base.OnMouseDown(e);
+        }
         protected override void OnMouseUp(MouseEventArgs e)
         {
             int h = HitAt(e.Location);
