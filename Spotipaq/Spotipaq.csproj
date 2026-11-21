@@ -100,6 +100,9 @@
     <EmbeddedResource Include="resources\ic_shuffle.png">
       <LogicalName>ic_shuffle.png</LogicalName>
     </EmbeddedResource>
+    <EmbeddedResource Include="resources\ic_vol_fill.png">
+      <LogicalName>ic_vol_fill.png</LogicalName>
+    </EmbeddedResource>
     <EmbeddedResource Include="resources\ic_shuffle_big.png">
       <LogicalName>ic_shuffle_big.png</LogicalName>
     </EmbeddedResource>

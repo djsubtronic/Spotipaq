@@ -4,6 +4,11 @@
  * Spotify delivers an AES-128-CTR encrypted Ogg Vorbis file. .NET downloads it in chunks and pushes the encrypted
  * bytes in with spq_audio_feed() (decrypted here); a decoder thread demuxes Ogg, decodes Vorbis (spq_vorbis.c,
  * x87 floats only - no SSE, this runs on a Pentium II) and plays through waveOut. One stream at a time.
+ *
+ * The decoder runs up to 1.5 s ahead into a ring of 16-bit samples; only about 0.1 s of that is handed to waveOut
+ * at any time. Volume and fades are applied on the way from the ring to the device, so they are heard within
+ * that 0.1 s: pause / resume fade over 333 ms, a stream starts with a 166 ms fade-in and a stopped one fades out
+ * over 166 ms (on its own, after spq_audio_stop has already returned - the next track can be opening meanwhile).
  */
 #define WIN32_LEAN_AND_MEAN
 #define _WIN32_WINNT 0x0501
@@ -17,8 +22,16 @@
 #define SPQ_API __declspec(dllexport)
 
 #define SPOTIFY_HEADER 0xa7            /* Spotify's own first bytes, skipped before the Ogg stream */
-#define NBUF 32
-#define BUF_FRAMES 2048
+#define RING_FRAMES 65536              /* decoded audio waiting to be played (a power of two): 1.5 s at 44.1 kHz */
+#define RING_MASK (RING_FRAMES - 1)
+#define MAX_OUT 4096                   /* most frames one Vorbis packet can produce */
+#define PACE_FRAMES 16384              /* with this much decoded, decode at the pace the device plays (no CPU bursts) */
+#define NBUF 8
+#define OUT_FRAMES 1024                /* one waveOut buffer: 23 ms */
+#define QUEUE 6                        /* buffers kept queued in the device: about 0.14 s */
+#define FADE_ONE (1 << 24)
+#define FADE_PAUSE_MS 333
+#define FADE_TRACK_MS 166
 
 enum { ST_NONE = 0, ST_BUFFERING = 1, ST_PLAYING = 2, ST_PAUSED = 3, ST_ENDED = 4, ST_ERROR = -1 };
 
@@ -28,11 +41,16 @@ typedef struct {
     uint8_t* buf; size_t total; volatile size_t filled;
     AES_KEY aes; uint8_t iv[16], ecount[16]; unsigned int num;
 
-    HANDLE thread, ev_data, ev_cmd, ev_wave;
+    HANDLE thread, ev_data, ev_cmd, ev_wave, ev_faded;
     volatile LONG stop, paused, seek_ms, buffering, ended, error, volume, start_ms, pos_base_ms;
+    volatile LONG fade_to, fade_ms;          /* 1 = audible, 0 = silent; how long the way there takes */
+    volatile LONG dying;                     /* stopped: fade out, then the reaper frees the session */
 
-    HWAVEOUT hwo; WAVEHDR hdr[NBUF]; short* pcm[NBUF]; int busy[NBUF]; int next;
-    int cur, cur_fill;                       /* buffer being filled, frames in it */
+    HWAVEOUT hwo; WAVEHDR hdr[NBUF]; short* pcm[NBUF]; int busy[NBUF]; int queued;
+    short* ring; int rr, rcount;             /* interleaved stereo; read index and frames waiting */
+    int fade;                                /* current fade gain, 0 .. FADE_ONE */
+    int vg;                                  /* current volume gain (Q15), gliding towards the set volume; -1 = not set yet */
+    int eof;                                 /* the decoder has reached the end of the stream */
     int rate, channels;
 
     ogg_reader og; vorbis_dec* vd;
@@ -53,7 +71,7 @@ static void lock_init(void)
 /* ------------------------------------------------------------------ helpers */
 static size_t avail_bytes(Sess* s) { size_t f = s->filled; return f > SPOTIFY_HEADER ? f - SPOTIFY_HEADER : 0; }
 
-static int interrupted(Sess* s) { return s->stop || s->seek_ms >= 0; }
+static int interrupted(Sess* s) { return s->stop || s->dying || s->seek_ms >= 0; }
 
 /* Waits a little for more data / a command. Returns 0 when we should abort (stop or seek request pending). */
 static int wait_data(Sess* s)
@@ -88,29 +106,7 @@ static void scan_pages(Sess* s)
     }
 }
 
-/* ------------------------------------------------------------------ wave output */
-static int acquire(Sess* s)                      /* free buffer index, or -1 when interrupted */
-{
-    for (;;) {
-        int i = s->next;
-        if (!s->busy[i] || (s->hdr[i].dwFlags & WHDR_DONE)) { s->busy[i] = 0; s->next = (i + 1) % NBUF; return i; }
-        WaitForSingleObject(s->ev_wave, 50);
-        if (interrupted(s)) return -1;
-    }
-}
-
-static void submit(Sess* s)
-{
-    int i = s->cur;
-    if (i < 0) return;
-    if (s->cur_fill < BUF_FRAMES) memset(s->pcm[i] + s->cur_fill * 2, 0, (BUF_FRAMES - s->cur_fill) * 4);
-    s->hdr[i].dwBufferLength = BUF_FRAMES * 4;
-    s->hdr[i].dwFlags &= ~WHDR_DONE;
-    s->busy[i] = 1;
-    waveOutWrite(s->hwo, &s->hdr[i], sizeof(WAVEHDR));
-    s->cur = -1; s->cur_fill = 0;
-}
-
+/* ------------------------------------------------------------------ ring + wave output */
 static __inline short to_s16(float v)
 {
     union { float f; int i; } u;
@@ -118,25 +114,91 @@ static __inline short to_s16(float v)
     { int r = u.i - 0x4B400000; return (short)(r > 32767 ? 32767 : r < -32768 ? -32768 : r); }
 }
 
-/* Writes frames [from, n) of the decoded block into wave buffers. Returns 0 if interrupted. */
-static int emit(Sess* s, float** pcm, int from, int n)
+/* Appends frames [from, n) of the decoded block to the ring (the caller has made sure there is room). */
+static void ring_write(Sess* s, float** pcm, int from, int n)
 {
-    float gain = (float)s->volume / 100.0f; float scale;
-    int i;
-    gain = gain * gain; scale = 32767.0f * gain; (void)scale;
-    for (i = from; i < n; ) {
-        int room, take, k;
-        if (s->cur < 0) { s->cur = acquire(s); s->cur_fill = 0; if (s->cur < 0) return 0; }
-        room = BUF_FRAMES - s->cur_fill; take = n - i < room ? n - i : room;
-        {
-            short* o = s->pcm[s->cur] + s->cur_fill * 2;
-            const float* l = pcm[0] + i, * r = s->channels > 1 ? pcm[1] + i : pcm[0] + i;
-            for (k = 0; k < take; k++) { o[2 * k] = to_s16(l[k] * gain * 32767.0f); o[2 * k + 1] = to_s16(r[k] * gain * 32767.0f); }
-        }
-        s->cur_fill += take; i += take;
-        if (s->cur_fill >= BUF_FRAMES) submit(s);
+    const float* l = pcm[0], * r = s->channels > 1 ? pcm[1] : pcm[0];
+    int w = (s->rr + s->rcount) & RING_MASK, i;
+    for (i = from; i < n; i++) {
+        short* o = s->ring + w * 2;
+        o[0] = to_s16(l[i] * 32767.0f); o[1] = to_s16(r[i] * 32767.0f);
+        w = (w + 1) & RING_MASK;
     }
-    return 1;
+    s->rcount += n - from;
+}
+
+static void reclaim(Sess* s)
+{
+    int i;
+    for (i = 0; i < NBUF; i++) if (s->busy[i] && (s->hdr[i].dwFlags & WHDR_DONE)) { s->busy[i] = 0; s->queued--; }
+}
+
+/* Fully faded out (paused, or a stopped stream that has finished its fade): nothing more goes to the device. */
+static int held(Sess* s) { return s->fade_to == 0 && s->fade == 0; }
+
+/* Moves up to `take` frames from the ring into `out`, applying the volume and the fade. Returns how many it
+ * produced: fewer than asked when a fade-out reaches silence, so the rest stays in the ring for the resume.
+ * A volume change glides over about 30 ms instead of stepping (a step is a click). */
+static int render(Sess* s, short* out, int take)
+{
+    int vol = (int)s->volume, vg = vol * vol * 32768 / 10000;       /* Q15, squared for a natural volume curve */
+    int target = s->fade_to ? FADE_ONE : 0, done = 0;
+    if (s->vg < 0) s->vg = vg;                                      /* first buffer: start at the set volume */
+    while (done < take) {
+        int seg = RING_FRAMES - s->rr, used = 0, k;
+        const short* in = s->ring + s->rr * 2;
+        short* o = out + done * 2;
+        if (seg > take - done) seg = take - done;
+        if (s->fade == target && s->vg == vg) {                     /* steady: the usual case */
+            if (target == 0) break;
+            if (vg == 32768) memcpy(o, in, (size_t)seg * 4);
+            else for (k = 0; k < seg * 2; k++) o[k] = (short)((in[k] * vg) >> 15);
+            used = seg;
+        }
+        else {
+            int ms = (int)s->fade_ms, frames, step, f = s->fade, v = s->vg, vstep = 32768 * 34 / (s->rate > 0 ? s->rate : 44100) + 1;
+            if (ms < 1) ms = 1;
+            frames = (int)((int64_t)s->rate * ms / 1000); if (frames < 1) frames = 1;
+            step = FADE_ONE / frames; if (step < 1) step = 1;
+            while (used < seg && (f != target || v != vg)) {
+                int g;
+                if (f < target) { f += step; if (f > target) f = target; }
+                else if (f > target) { f -= step; if (f < target) f = target; }
+                if (v < vg) { v += vstep; if (v > vg) v = vg; }
+                else if (v > vg) { v -= vstep; if (v < vg) v = vg; }
+                g = (v * (f >> 9)) >> 15;                           /* Q15 */
+                o[2 * used] = (short)((in[2 * used] * g) >> 15); o[2 * used + 1] = (short)((in[2 * used + 1] * g) >> 15);
+                used++;
+                if (f == 0 && target == 0) break;                   /* silent: stop here, whatever the volume is doing */
+            }
+            s->fade = f; s->vg = v;
+            if (f == 0 && target == 0) s->vg = vg;
+        }
+        s->rr = (s->rr + used) & RING_MASK; s->rcount -= used; done += used;
+    }
+    return done;
+}
+
+/* Tops the device queue up from the ring. Returns 1 if it handed anything over. */
+static int pump(Sess* s)
+{
+    int wrote = 0;
+    if (!s->hwo) return 0;
+    reclaim(s);
+    while (s->queued < QUEUE && s->rcount > 0 && !held(s)) {
+        int i, n, take = s->rcount < OUT_FRAMES ? s->rcount : OUT_FRAMES;
+        if (take < OUT_FRAMES && !s->eof && s->fade_to) break;      /* wait for a full buffer, except at the end or while fading out */
+        for (i = 0; i < NBUF; i++) if (!s->busy[i]) break;
+        if (i == NBUF) break;
+        n = render(s, s->pcm[i], take);
+        if (n <= 0) break;
+        s->hdr[i].dwBufferLength = (DWORD)n * 4;
+        s->hdr[i].dwFlags &= ~WHDR_DONE;
+        s->busy[i] = 1; s->queued++;
+        waveOutWrite(s->hwo, &s->hdr[i], sizeof(WAVEHDR));
+        wrote = 1;
+    }
+    return wrote;
 }
 
 /* ------------------------------------------------------------------ seeking */
@@ -151,10 +213,10 @@ static void do_seek(Sess* s, int ms)
     int i, best, j;
     if (s->hwo) waveOutReset(s->hwo);
     for (i = 0; i < NBUF; i++) s->busy[i] = 0;
-    s->cur = -1; s->cur_fill = 0; s->next = 0;
+    s->queued = 0; s->rr = 0; s->rcount = 0; s->eof = 0;
+    s->fade = 0;                                         /* comes back in with a fade instead of a click (or stays silent, if paused) */
     InterlockedExchange(&s->ended, 0);
     InterlockedExchange(&s->pos_base_ms, ms);
-    if (s->paused) { /* stay paused: waveOutReset leaves the device paused */ }
     for (;;) {
         int beyond = 0;
         scan_pages(s);
@@ -167,7 +229,7 @@ static void do_seek(Sess* s, int ms)
         while (j < s->npages && (s->pages[j].hdr & 1)) j++;
         if (beyond&& j < s->npages) break;
         if (s->filled >= s->total) {                     /* whole file here */
-            if (j >= s->npages) { InterlockedExchange(&s->ended, 1); return; }
+            if (j >= s->npages) { s->eof = 1; return; }      /* past the end: nothing to play, the main loop reports it */
             break;
         }
         if (!wait_data(s)) return;                       /* new command arrived; caller re-dispatches */
@@ -179,21 +241,6 @@ static void do_seek(Sess* s, int ms)
 }
 
 /* ------------------------------------------------------------------ decoder thread */
-static void finish_stream(Sess* s)
-{
-    int i;
-    if (s->cur >= 0 && s->cur_fill > 0) submit(s);
-    s->cur = -1;
-    for (;;) {
-        int any = 0;
-        for (i = 0; i < NBUF; i++) if (s->busy[i] && !(s->hdr[i].dwFlags & WHDR_DONE)) any = 1;
-        if (!any) break;
-        WaitForSingleObject(s->ev_wave, 50);
-        if (interrupted(s)) return;
-    }
-    InterlockedExchange(&s->ended, 1);
-}
-
 static int open_wave(Sess* s)
 {
     WAVEFORMATEX wf; int i;
@@ -202,13 +249,13 @@ static int open_wave(Sess* s)
     wf.nBlockAlign = 4; wf.nAvgBytesPerSec = s->rate * 4;
     if (waveOutOpen(&s->hwo, WAVE_MAPPER, &wf, (DWORD_PTR)s->ev_wave, 0, CALLBACK_EVENT) != MMSYSERR_NOERROR) { s->hwo = NULL; return 0; }
     for (i = 0; i < NBUF; i++) {
-        s->pcm[i] = (short*)calloc(BUF_FRAMES * 2, sizeof(short));
+        s->pcm[i] = (short*)calloc(OUT_FRAMES * 2, sizeof(short));
         memset(&s->hdr[i], 0, sizeof(WAVEHDR));
-        s->hdr[i].lpData = (LPSTR)s->pcm[i]; s->hdr[i].dwBufferLength = BUF_FRAMES * 4;
+        s->hdr[i].lpData = (LPSTR)s->pcm[i]; s->hdr[i].dwBufferLength = OUT_FRAMES * 4;
         waveOutPrepareHeader(s->hwo, &s->hdr[i], sizeof(WAVEHDR));
         s->busy[i] = 0;
     }
-    if (s->paused) waveOutPause(s->hwo);
+    s->queued = 0;
     return 1;
 }
 
@@ -216,17 +263,17 @@ static DWORD WINAPI dec_thread(LPVOID arg)
 {
     Sess* s = (Sess*)arg;
     int idx = 0, errors = 0;
+    HANDLE ev[3];
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
 
     og_init(&s->og, s->buf + SPOTIFY_HEADER);
     s->vd = vd_create();
-    s->cur = -1;
     InterlockedExchange(&s->buffering, 1);
 
     /* the three header packets */
     while (idx < 3) {
         const uint8_t* p; int len, eos, r; int64_t g;
-        if (s->stop) goto done;
+        if (s->stop || s->dying) goto done;
         s->og.avail = avail_bytes(s);
         r = og_next(&s->og, &p, &len, &g, &eos);
         if (r == 1) { if (vd_header(s->vd, p, len, idx) != 0) { InterlockedExchange(&s->error, 1); goto done; } idx++; }
@@ -238,40 +285,61 @@ static DWORD WINAPI dec_thread(LPVOID arg)
     s->scan_pos = s->og.pos;                             /* first audio page */
     if (s->start_ms > 0) { InterlockedExchange(&s->seek_ms, s->start_ms); SetEvent(s->ev_cmd); }
     InterlockedExchange(&s->buffering, 0);
+    ev[0] = s->ev_wave; ev[1] = s->ev_cmd; ev[2] = s->ev_data;
 
     while (!s->stop) {
-        const uint8_t* p; int len, eos, r; int64_t g;
-        float** pcm; int n;
+        int progressed, idle = 0;
 
-        if (s->seek_ms >= 0) {
+        if (s->seek_ms >= 0 && !s->dying) {
             LONG ms = InterlockedExchange(&s->seek_ms, -1);
             do_seek(s, (int)ms);
             InterlockedExchange(&s->buffering, 0);
             errors = 0;
             continue;
         }
-        if (s->ended) { WaitForSingleObject(s->ev_cmd, 100); continue; }
 
-        s->og.avail = avail_bytes(s);
-        r = og_next(&s->og, &p, &len, &g, &eos);
-        if (r == 0) {
-            if (s->filled >= s->total) { finish_stream(s); continue; }
-            wait_data(s);
-            continue;
+        progressed = pump(s);                            /* ring -> device, with volume and fades */
+        if (!s->fade_to && s->fade && s->rcount == 0 && s->queued == 0) s->fade = 0;      /* paused with nothing left to fade: silent already */
+
+        if (s->dying) {                                  /* stopped: once the fade-out has played, tell the reaper */
+            if (s->queued == 0 && (held(s) || s->rcount == 0)) { SetEvent(s->ev_faded); idle = 1; }
         }
-        InterlockedExchange(&s->buffering, 0);
-        if (r < 0) { finish_stream(s); continue; }
-        if (vd_decode(s->vd, p, len, &pcm, &n) != 0) { if (++errors > 200) { InterlockedExchange(&s->error, 1); break; } continue; }
-        errors = 0;
-        if (n > 0) {
-            int skip = 0;
-            if (s->discard > 0) { skip = s->discard >= n ? n : (int)s->discard; s->discard -= skip; }
-            if (skip < n && !emit(s, pcm, skip, n)) continue;      /* interrupted: loop handles seek/stop */
+        else if (s->eof) {
+            if (s->rcount == 0 && s->queued == 0) { if (!s->ended) InterlockedExchange(&s->ended, 1); idle = 1; }
         }
-        if (eos) finish_stream(s);
+        else if (RING_FRAMES - s->rcount >= MAX_OUT) {   /* room for one more packet: decode -> ring */
+            const uint8_t* p; int len, eos, r, n; int64_t g; float** pcm;
+            s->og.avail = avail_bytes(s);
+            r = og_next(&s->og, &p, &len, &g, &eos);
+            if (r == 0) {
+                if (s->filled >= s->total) s->eof = 1;                                /* whole file decoded */
+                else if (s->rcount == 0 && s->queued == 0) InterlockedExchange(&s->buffering, 1);   /* run dry: waiting for the download */
+            }
+            else if (r < 0) s->eof = 1;
+            else {
+                InterlockedExchange(&s->buffering, 0);
+                if (vd_decode(s->vd, p, len, &pcm, &n) != 0) { if (++errors > 200) { InterlockedExchange(&s->error, 1); break; } }
+                else {
+                    errors = 0;
+                    if (n > 0) {
+                        int skip = 0;
+                        if (s->discard > 0) { skip = s->discard >= n ? n : (int)s->discard; s->discard -= skip; }
+                        if (skip < n) ring_write(s, pcm, skip, n);
+                    }
+                    if (eos) s->eof = 1;
+                }
+                /* Far enough ahead: one packet per device buffer is plenty, so wait for the device instead of
+                 * racing to fill the ring (that burst is what made the UI stutter when a track started). */
+                if (s->rcount < PACE_FRAMES) progressed = 1;
+            }
+        }
+        if (held(s) && !s->dying) idle = 1;              /* paused */
+
+        if (!progressed) WaitForMultipleObjects(3, ev, FALSE, idle ? 200 : 40);
     }
 
 done:
+    if (s->ev_faded) SetEvent(s->ev_faded);
     return 0;
 }
 
@@ -293,19 +361,38 @@ static void sess_destroy(Sess* s)
     for (i = 0; i < NBUF; i++) free(s->pcm[i]);
     if (s->vd) vd_destroy(s->vd);
     og_free(&s->og);
-    free(s->pages); free(s->buf);
+    free(s->pages); free(s->buf); free(s->ring);
+    if (s->ev_faded) CloseHandle(s->ev_faded);
     if (s->ev_data) CloseHandle(s->ev_data);
     if (s->ev_cmd) CloseHandle(s->ev_cmd);
     if (s->ev_wave) CloseHandle(s->ev_wave);
     free(s);
 }
 
+/* Lets a stopped stream finish its fade-out (it tells us when it has, or we stop waiting), then frees it. */
+static DWORD WINAPI reaper(LPVOID arg)
+{
+    Sess* s = (Sess*)arg;
+    WaitForSingleObject(s->ev_faded, FADE_TRACK_MS + 450);
+    sess_destroy(s);
+    return 0;
+}
+
+/* Returns at once. What was playing fades out on its own; closing the device and freeing the stream also happen
+ * off the caller's thread, so the UI never waits for the audio device. */
 SPQ_API void __cdecl spq_audio_stop(void)
 {
-    Sess* s;
+    Sess* s; HANDLE h;
     lock_init();
     EnterCriticalSection(&g_cs); s = g_sess; g_sess = NULL; LeaveCriticalSection(&g_cs);
-    sess_destroy(s);
+    if (!s) return;
+    if (!s->thread) { sess_destroy(s); return; }         /* never started: nothing to wait for */
+    InterlockedExchange(&s->fade_ms, FADE_TRACK_MS);
+    InterlockedExchange(&s->fade_to, 0);
+    InterlockedExchange(&s->dying, 1);
+    SetEvent(s->ev_cmd);
+    h = CreateThread(NULL, 0, reaper, s, 0, NULL);
+    if (h) CloseHandle(h); else sess_destroy(s);
 }
 
 /* key: 16-byte AES key. total: size of the whole file in bytes (a few MB). */
@@ -321,7 +408,12 @@ SPQ_API int __cdecl spq_audio_open(const unsigned char* key, int total)
     s->total = (size_t)total;
     AES_set_encrypt_key(key, 128, &s->aes);
     memcpy(s->iv, IV, 16);
+    s->ring = (short*)malloc(RING_FRAMES * 2 * sizeof(short));
+    if (!s->ring) { free(s->buf); free(s); return 0; }
     s->volume = 100; s->seek_ms = -1; s->start_ms = 0;
+    s->fade = 0; s->fade_to = 1; s->fade_ms = FADE_TRACK_MS;     /* a new track fades in */
+    s->vg = -1;
+    s->ev_faded = CreateEvent(NULL, FALSE, FALSE, NULL);
     s->ev_data = CreateEvent(NULL, FALSE, FALSE, NULL);
     s->ev_cmd = CreateEvent(NULL, FALSE, FALSE, NULL);
     s->ev_wave = CreateEvent(NULL, FALSE, FALSE, NULL);
@@ -370,9 +462,11 @@ SPQ_API void __cdecl spq_audio_pause(int paused)
     lock_init();
     EnterCriticalSection(&g_cs);
     s = g_sess;
-    if (s) {
+    if (s) {                                             /* fades out, then stops feeding the device; and back */
         InterlockedExchange(&s->paused, paused ? 1 : 0);
-        if (s->hwo) { if (paused) waveOutPause(s->hwo); else waveOutRestart(s->hwo); }
+        InterlockedExchange(&s->fade_ms, FADE_PAUSE_MS);
+        InterlockedExchange(&s->fade_to, paused ? 0 : 1);
+        SetEvent(s->ev_cmd);
     }
     LeaveCriticalSection(&g_cs);
 }

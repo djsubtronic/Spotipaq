@@ -6,7 +6,9 @@
 //   resources\emoji_big.png  the same cells at 28 px, for the big page titles (drawn 1:1 there)
 //   resources\emoji.txt      index: "E <tab> code points in hex, dash separated <tab> cell [<tab> T]"
 //
-// All three are embedded in the exe. A sheet is only decoded the first time something needs it.
+// All three are embedded in the exe. A sheet is only decoded the first time something needs it, and on a
+// background thread (decoding one takes a second or two on the Pentium II): until it is ready the emoji are
+// simply left blank, then SheetLoaded fires and the window repaints with them.
 // Matching ignores U+FE0F, except for symbols that are text by default ("T"): those only become an emoji when
 // followed by FE0F.
 using System;
@@ -17,6 +19,7 @@ using System.Drawing.Imaging;
 using System.IO;
 using System.Reflection;
 using System.Text;
+using System.Threading;
 
 namespace Spotipaq
 {
@@ -26,8 +29,14 @@ namespace Spotipaq
         public const int BigCell = 28;      // emoji_big.png
         const int Cols = 64;
 
-        static bool _loaded, _triedSmall, _triedBig;
-        static Bitmap _small, _big;
+        static readonly object _sync = new object();
+        static bool _loaded;
+        static readonly Bitmap[] _sheet = new Bitmap[2];             // 0 = emoji.png, 1 = emoji_big.png
+        static readonly int[] _sheetState = new int[2];              // 0 not asked for, 1 loading, 2 done (the bitmap may be null: missing)
+        /// <summary>A sprite sheet finished loading. Raised on the loader thread.</summary>
+        public static event EventHandler SheetLoaded;
+        /// <summary>True while a sheet is being decoded: pictures that aren't there yet will be shortly.</summary>
+        public static bool Loading { get { return Thread.VolatileRead(ref _sheetState[0]) == 1 || Thread.VolatileRead(ref _sheetState[1]) == 1; } }
         static readonly Dictionary<string, int> _map = new Dictionary<string, int>();
         static readonly Dictionary<string, bool> _textDefault = new Dictionary<string, bool>();
         static readonly Dictionary<int, Bitmap> _cache = new Dictionary<int, Bitmap>();     // (size << 16 | cell) -> picture
@@ -45,10 +54,22 @@ namespace Spotipaq
             return sb.ToString();
         }
 
+        /// <summary>Reads the index in the background at start-up, so the first emoji doesn't make the window wait for it.</summary>
+        public static void Warm() { ThreadPool.QueueUserWorkItem(delegate { Load(); }); }
+
         static void Load()
         {
             if (_loaded) return;
-            _loaded = true;
+            lock (_sync)
+            {
+                if (_loaded) return;
+                LoadIndex();
+                _loaded = true;
+            }
+        }
+
+        static void LoadIndex()
+        {
             try
             {
                 using (Stream s = Assembly.GetExecutingAssembly().GetManifestResourceStream("emoji.txt"))
@@ -94,8 +115,29 @@ namespace Spotipaq
             catch (Exception) { return null; }
         }
 
-        static Bitmap Small { get { if (!_triedSmall) { _triedSmall = true; _small = LoadSheet("emoji.png"); } return _small; } }
-        static Bitmap Big { get { if (!_triedBig) { _triedBig = true; _big = LoadSheet("emoji_big.png"); } return _big; } }
+        /// <summary>The sheet, or null while it is still loading (pending = true) or if it is missing. The first call
+        /// starts the load on a low-priority background thread.</summary>
+        static Bitmap Sheet(int which, out bool pending)
+        {
+            int st = Thread.VolatileRead(ref _sheetState[which]);
+            if (st == 0 && Interlocked.CompareExchange(ref _sheetState[which], 1, 0) == 0)
+            {
+                Thread t = new Thread(delegate ()
+                {
+                    Bitmap b = LoadSheet(which == 0 ? "emoji.png" : "emoji_big.png");
+                    lock (_sync) _sheet[which] = b;
+                    Thread.VolatileWrite(ref _sheetState[which], 2);
+                    EventHandler h = SheetLoaded;
+                    if (h != null) try { h(null, EventArgs.Empty); } catch (Exception) { }
+                });
+                t.IsBackground = true; t.Priority = ThreadPriority.BelowNormal; t.Name = "Emoji sheet";
+                t.Start();
+                st = 1;
+            }
+            pending = st != 2;
+            if (pending) return null;
+            lock (_sync) return _sheet[which];
+        }
 
         static bool Continues(char next, char prev)
         {
@@ -149,8 +191,10 @@ namespace Spotipaq
             Bitmap b;
             if (_cache.TryGetValue(key, out b)) return b;
             Bitmap sheet = null; int cs = Cell;
-            if (size > Cell) { sheet = Big; cs = BigCell; }
-            if (sheet == null) { sheet = Small; cs = Cell; }
+            bool pending = false, p;
+            if (size > Cell) { sheet = Sheet(1, out p); pending |= p; cs = BigCell; }
+            if (sheet == null && !pending) { sheet = Sheet(0, out p); pending |= p; cs = Cell; }
+            if (pending) return null;                    // not remembered: ask again once the sheet is in (see SheetLoaded)
             if (sheet != null)
             {
                 int sx = (cell % Cols) * cs, sy = (cell / Cols) * cs;

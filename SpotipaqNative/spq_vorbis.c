@@ -419,16 +419,35 @@ static void imdct_run(Imdct *m, const float *X, float *y, float scale)
         vr[r] = re * m->pre_re[j] - im * m->pre_im[j];
         vi[r] = re * m->pre_im[j] + im * m->pre_re[j];
     }
-    for (len = 2; len <= h; len <<= 1) {
-        half = len >> 1;
+    /* The first two FFT stages only ever multiply by 1 and -i, so they are done with additions alone
+     * (a quarter of all the butterflies, with no multiplies and no table lookups). */
+    if (h >= 2)
+        for (k = 0; k < h; k += 2) {
+            float tr = vr[k + 1], ti = vi[k + 1];
+            vr[k + 1] = vr[k] - tr; vi[k + 1] = vi[k] - ti;
+            vr[k] += tr; vi[k] += ti;
+        }
+    if (h >= 4)
+        for (k = 0; k < h; k += 4) {
+            float tr = vr[k + 2], ti = vi[k + 2];
+            vr[k + 2] = vr[k] - tr; vi[k + 2] = vi[k] - ti;
+            vr[k] += tr; vi[k] += ti;
+            tr = vi[k + 3]; ti = -vr[k + 3];                         /* times -i */
+            vr[k + 3] = vr[k + 1] - tr; vi[k + 3] = vi[k + 1] - ti;
+            vr[k + 1] += tr; vi[k + 1] += ti;
+        }
+    for (len = 8; len <= h; len <<= 1) {
+        const float *twr = m->tw_re, *twi = m->tw_im;
         int tstep = h / len;
+        half = len >> 1;
         for (k = 0; k < h; k += len) {
-            for (j = 0; j < half; j++) {
-                float wr = m->tw_re[j * tstep], wi = m->tw_im[j * tstep];
-                int a = k + j, bb = a + half;
-                float tr = vr[bb] * wr - vi[bb] * wi, ti = vr[bb] * wi + vi[bb] * wr;
-                vr[bb] = vr[a] - tr; vi[bb] = vi[a] - ti;
-                vr[a] += tr; vi[a] += ti;
+            float *ar = vr + k, *ai = vi + k, *br = ar + half, *bi = ai + half;
+            int t = 0;
+            for (j = 0; j < half; j++, t += tstep) {
+                float wr = twr[t], wi = twi[t];
+                float tr = br[j] * wr - bi[j] * wi, ti = br[j] * wi + bi[j] * wr;
+                br[j] = ar[j] - tr; bi[j] = ai[j] - ti;
+                ar[j] += tr; ai[j] += ti;
             }
         }
     }
@@ -731,12 +750,17 @@ int vd_decode(vorbis_dec *d, const uint8_t *pkt, int len, float ***out, int *nou
         int outlen = d->prev_n / 4 + n / 4, a;
         for (c = 0; c < d->channels; c++) {
             float *o = d->outp[c], *y = d->buf[c], *pr = d->prev[c];
-            for (a = 0; a < outlen; a++) {
-                float v = a < d->prev_n / 2 ? pr[a] : 0.0f;
-                int bi = a - d->prev_n / 4 + n / 4;
-                if (bi >= 0 && bi < h) v += y[bi];
-                o[a] = v;
-            }
+            /* o[a] = previous block's tail + this block's head, where they overlap. The two were combined
+             * with a test per sample; the ranges are fixed, so they are worked out once instead. */
+            int pn = d->prev_n / 2, shift = n / 4 - d->prev_n / 4;     /* y index = a + shift */
+            int lo = shift < 0 ? -shift : 0, hi = h - shift;           /* y contributes for lo <= a < hi */
+            int pe = pn < outlen ? pn : outlen;
+            if (hi > outlen) hi = outlen;
+            if (lo > outlen) lo = outlen;
+            if (hi < lo) hi = lo;
+            memcpy(o, pr, sizeof(float) * pe);
+            for (a = pe; a < outlen; a++) o[a] = 0.0f;
+            { const float *ys = y + shift; for (a = lo; a < hi; a++) o[a] += ys[a]; }
         }
         *nout = outlen;
     }

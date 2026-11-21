@@ -17,6 +17,7 @@ namespace Spotipaq
         readonly NowPlayingBar _bar = new NowPlayingBar();
         readonly PageView _page;
         readonly Timer _tick = new Timer();
+        readonly Timer _artPaint = new Timer();      // gathers artwork arrivals into one repaint
 
         // An external URL waits for the corresponding page data before starting playback.
         string _linkTargetKind, _linkTargetId, _linkTrackId;
@@ -70,6 +71,7 @@ namespace Spotipaq
                                           : (_settings.GetBool("repeat", false) ? RepeatAll : RepeatOff);
             _player.Volume = Math.Max(0, Math.Min(100, _settings.GetInt("volume", 80)));
             int pos; _restored = _settings.GetTrack(out pos); _restoredPos = pos;
+            _playSource = _settings.GetString("queue.source", null);      // the playlist last time's song was started from
             RestoreQueue();
 
             _images = new ImageCache(backend, this);
@@ -81,7 +83,17 @@ namespace Spotipaq
             Controls.Add(_page); Controls.Add(_sidebar); Controls.Add(_top); Controls.Add(_bar); Controls.Add(_title);
             ArrangeChrome();
 
-            _images.Loaded += delegate { _page.Invalidate(); _bar.Invalidate(); _sidebar.Invalidate(); };
+            // Covers arrive one by one; repainting everything for each made a page of thumbnails repaint dozens of times.
+            _artPaint.Interval = 60;
+            _artPaint.Tick += delegate { _artPaint.Stop(); _page.Invalidate(); _bar.Invalidate(); _sidebar.Invalidate(); };
+            _images.Loaded += delegate { if (!_artPaint.Enabled) _artPaint.Start(); };
+            // emoji: read the index now, off the UI thread; repaint when a sprite sheet has been decoded in the background
+            Emoji.Warm();
+            Emoji.SheetLoaded += delegate
+            {
+                try { if (IsHandleCreated && !IsDisposed) BeginInvoke(new MethodInvoker(delegate { _page.Invalidate(); _sidebar.Invalidate(); _bar.Invalidate(); _title.Invalidate(); })); }
+                catch (Exception) { }
+            };
             _sidebar.ItemClicked += delegate (object s, NavEventArgs e) { Navigate(e.Target); };
             _sidebar.ItemContext += delegate (object s, NavEventArgs e) { ShowNavMenu(e.Target); };
             _sidebar.PlaylistsReordered += delegate (object s, OrderEventArgs e) { _settings.Set("playlistOrder", String.Join(",", e.Ids.ToArray())); _settings.Save(); };
@@ -149,6 +161,11 @@ namespace Spotipaq
                 (m.HWnd == _title.Handle || m.HWnd == _sidebar.Handle || m.HWnd == _bar.Handle ||
                  (m.HWnd == _top.Handle && !_top.SearchFrame.Contains(_top.PointToClient(Cursor.Position)))))
                 _page.Focus();
+            // a click on the window or on any of the other panels takes the selection off the track list
+            if ((m.Msg == 0x0201 || m.Msg == 0x0204) &&
+                (m.HWnd == Handle || m.HWnd == _title.Handle || m.HWnd == _sidebar.Handle || m.HWnd == _bar.Handle ||
+                 m.HWnd == _top.Handle || m.HWnd == _top.SearchBox.Handle))
+                _page.ClearSelection();
             if (m.Msg != 0x020A) return false;                 // WM_MOUSEWHEEL
             IntPtr under = WindowFromPoint(Cursor.Position);
             if (under == IntPtr.Zero || under == m.HWnd) return false;
@@ -216,7 +233,7 @@ namespace Spotipaq
         // Layout: black window with a 1 px border; title bar on top, player bar at the bottom, and between them three
         // rounded cards - search and library on the left, the page on the right - with black gaps around them.
         // Edge = the border plus a few black pixels the form itself owns all round: that strip is the resize grip.
-        const int Edge = 4, Gap = 8, LeftW = 240;
+        const int Edge = 4, Gap = 8, LeftW = 269;
         static readonly Color BorderColor = Color.FromArgb(56, 56, 56);
 
         void ArrangeChrome()
@@ -510,6 +527,7 @@ namespace Spotipaq
             _settings.Set("shuffle", _shuffle);
             _settings.Set("repeat", _repeatMode != RepeatOff);
             _settings.Set("repeatMode", _repeatMode);
+            _settings.Set("queue.source", _playSource);
             if (full)
             {
                 TrackWindow();
@@ -824,11 +842,17 @@ namespace Spotipaq
             ShowPage(Current);
         }
 
+        string _playSource;                              // id of the playlist the queue came from, if it was one
+
         public void PlayList(List<Track> tracks, int index)
         {
             if (tracks == null || index < 0 || index >= tracks.Count) return;
             _restored = null;
             _auto = false; _skipStreak = 0;
+            NavTarget from = Current;                    // the page it was started from: a playlist gets the speaker in the library
+            _playSource = from != null && from.Kind == PageKind.Playlist ? from.Id : null;
+            _settings.Set("queue.source", _playSource);      // written straight away, so it survives however the app ends
+            _settings.Save();
             _queue = new List<Track>(tracks);
             BuildOrder(index);
             _queueDirty = true;
@@ -1088,13 +1112,18 @@ namespace Spotipaq
         void RefreshBar()
         {
             Track t = _player.Current ?? _restored;
+            bool playing = IsPlaying;
+            int volume = _bar.DraggingVolume ? _bar.Volume : _player.Volume;
+            // the usual case, twice a second while playing: only the position moved
+            bool onlyPosition = _bar.Track == t && _bar.Playing == playing && _bar.Shuffle == _shuffle && _bar.RepeatMode == _repeatMode && _bar.Volume == volume;
             _bar.Track = t;
-            _bar.Playing = IsPlaying;
+            _bar.Playing = playing;
             _bar.PositionMs = _player.Current != null ? _player.PositionMs : _restoredPos;
             _bar.Shuffle = _shuffle;
             _bar.RepeatMode = _repeatMode;
-            if (!_bar.DraggingVolume) _bar.Volume = _player.Volume;
-            _bar.Invalidate();
+            _bar.Volume = volume;
+            if (onlyPosition) _bar.InvalidateSeek(); else _bar.Invalidate();
+            _sidebar.SetPlaying(t != null ? _playSource : null, playing);      // t: the current song, or last session's waiting to resume
             string title = t == null ? "Spotipaq" : Emoji.Strip(t.ArtistName + " - " + t.Name);      // Windows can't draw emoji in the taskbar
             if (title.Length == 0 || title == "-") title = "Spotipaq";
             if (Text != title) Text = title;

@@ -24,7 +24,7 @@ namespace Spotipaq
         public static readonly Color Sidebar = Color.FromArgb(18, 18, 18);
         public static readonly Color Bar = Color.FromArgb(40, 40, 40);            // top + bottom bars
         public static readonly Color RowHover = Color.FromArgb(51, 51, 51);
-        public static readonly Color RowSelected = Color.FromArgb(64, 64, 64);
+        public static readonly Color RowSelected = Color.FromArgb(90, 90, 90);
         public static readonly Color Line = Color.FromArgb(40, 40, 40);
         public static readonly Color Text = Color.White;
         public static readonly Color SubText = Color.FromArgb(160, 160, 160);
@@ -37,15 +37,17 @@ namespace Spotipaq
         // machines without it.
         public static readonly string FontFamilyName = PickFamily("Figtree", "Segoe UI Variable Text", "Segoe UI Variable", "Segoe UI", "Tahoma");
         public static readonly string DisplayFamilyName = PickFamily("Figtree", "Segoe UI Variable Display", "Segoe UI Variable", "Segoe UI", "Tahoma");
-        public static readonly Font Small = Make(8.25f, FontStyle.Regular);
-        public static readonly Font SmallBold = Make(8.25f, FontStyle.Bold);
-        // the artist line in the player bar: one pixel smaller than Small (10 px against 11; text sizes go in whole pixels)
-        public static readonly Font BarArtist = new Font(FontFamilyName, 10f, FontStyle.Regular, GraphicsUnit.Pixel);
-        public static readonly Font Normal = Make(9f, FontStyle.Regular);
-        public static readonly Font NormalBold = Make(9f, FontStyle.Bold);
-        public static readonly Font Heading = Make(12f, FontStyle.Bold);
+        // Sizes are in pixels, each one pixel up from the old point sizes (8.25 pt = 11 px, 9 pt = 12 px, 12 pt = 16 px,
+        // 7.5 pt = 10 px). The big page titles (Huge) are unchanged.
+        public static readonly Font Small = Make(12f, FontStyle.Regular);
+        public static readonly Font SmallBold = Make(12f, FontStyle.Bold);
+        // the artist line in the player bar: one pixel smaller than Small
+        public static readonly Font BarArtist = Make(11f, FontStyle.Regular);
+        public static readonly Font Normal = Make(13f, FontStyle.Regular);
+        public static readonly Font NormalBold = Make(13f, FontStyle.Bold);
+        public static readonly Font Heading = Make(17f, FontStyle.Bold);
         public static readonly Font Huge = new Font(DisplayFamilyName, 20f, FontStyle.Bold);
-        public static readonly Font Label = Make(7.5f, FontStyle.Bold);           // "ALBUM", section headers
+        public static readonly Font Label = Make(11f, FontStyle.Bold);           // "ALBUM", section headers
 
         static string PickFamily(params string[] wanted)
         {
@@ -55,7 +57,7 @@ namespace Spotipaq
             foreach (string name in wanted) if (have.ContainsKey(name)) return name;
             return "Tahoma";
         }
-        static Font Make(float size, FontStyle style) { return new Font(FontFamilyName, size, style); }
+        static Font Make(float pixels, FontStyle style) { return new Font(FontFamilyName, pixels, style, GraphicsUnit.Pixel); }
 
         public const TextFormatFlags LeftEllipsis = TextFormatFlags.Left | TextFormatFlags.VerticalCenter |
             TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine;
@@ -233,6 +235,7 @@ namespace Spotipaq
                         x += run.Width;
                         continue;
                     }
+                    if (Emoji.Loading) { x += run.Width; continue; }      // its sheet is still being decoded: leave the space
                 }
                 if (run.Special)
                 {
@@ -268,6 +271,8 @@ namespace Spotipaq
         {
             if (r.Width < rad * 2 || r.Height < rad * 2) return;
             int d = rad * 2, x = r.Left, y = r.Top, x2 = r.Right, y2 = r.Bottom;
+            RectangleF cb = g.ClipBounds;                // a partial repaint that touches no corner: nothing to do
+            if ((cb.Left >= x + rad && cb.Right <= x2 - rad) || (cb.Top >= y + rad && cb.Bottom <= y2 - rad)) return;
             SmoothingMode sm = g.SmoothingMode; PixelOffsetMode po = g.PixelOffsetMode;
             g.SmoothingMode = SmoothingMode.AntiAlias; g.PixelOffsetMode = PixelOffsetMode.Half;
             using (SolidBrush b = new SolidBrush(outside))
@@ -356,7 +361,18 @@ namespace Spotipaq
                     g.FillEllipse(hole, r.Left + (r.Width - d) / 2, r.Top + (r.Height - d) / 2, d, d);
                 return;
             }
-            if (!round) { g.DrawImage(img, r); return; }
+            if (!round)
+            {
+                if (img.Width == r.Width && img.Height == r.Height)      // already the right size: copy, don't filter
+                {
+                    InterpolationMode im = g.InterpolationMode;
+                    g.InterpolationMode = InterpolationMode.NearestNeighbor;
+                    g.DrawImage(img, r);
+                    g.InterpolationMode = im;
+                }
+                else g.DrawImage(img, r);
+                return;
+            }
             using (GraphicsPath clip = new GraphicsPath())
             {
                 clip.AddEllipse(r);
@@ -691,6 +707,10 @@ namespace Spotipaq
         }
 
         bool Contains(Point p) { return Shown && p.X >= X && p.Y >= Top && p.Y < Bottom; }
+        /// <summary>True when the point is on the scrollbar.</summary>
+        public bool Over(Point p) { return Contains(p); }
+        // a change of the bar's own look (hover, release) repaints its strip only
+        void InvalidateBar() { _c.Invalidate(new Rectangle(X, Top, W, Math.Max(1, Bottom - Top))); }
         int ButtonAt(Point p) { if (!Contains(p)) return 0; return p.Y < Top + BtnH ? -1 : p.Y >= Bottom - BtnH ? 1 : 0; }
 
         public void Paint(Graphics g)
@@ -757,7 +777,7 @@ namespace Spotipaq
             int btn = ButtonAt(e.Location);
             bool onThumb = false;
             if (btn == 0 && Contains(e.Location)) { Rectangle t = Thumb(); onThumb = e.Y >= t.Top && e.Y < t.Bottom; }
-            if (btn != _hot || onThumb != _hotThumb) { _hot = btn; _hotThumb = onThumb; _c.Invalidate(); }
+            if (btn != _hot || onThumb != _hotThumb) { _hot = btn; _hotThumb = onThumb; InvalidateBar(); }
             return _held != 0 || Contains(e.Location);
         }
 
@@ -772,11 +792,11 @@ namespace Spotipaq
                 _repeat.Stop();
                 _c.Capture = false;
             }
-            _c.Invalidate();
+            InvalidateBar();
             return true;
         }
 
-        public void MouseLeave() { if (_hot != 0 || _hotThumb) { _hot = 0; _hotThumb = false; _c.Invalidate(); } }
+        public void MouseLeave() { if (_hot != 0 || _hotThumb) { _hot = 0; _hotThumb = false; InvalidateBar(); } }
     }
 
     /// <summary>Dark look for every ContextMenuStrip in the app (set once as ToolStripManager.Renderer).</summary>

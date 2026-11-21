@@ -19,7 +19,6 @@ namespace Spotipaq
         [System.Runtime.InteropServices.DllImport("user32.dll")] static extern bool DrawIconEx(IntPtr hdc, int x, int y, IntPtr icon, int w, int h, int step, IntPtr brush, int flags);
 
         public static readonly Color BarColor = Theme.Window;
-        static readonly Color TitleColor = Color.FromArgb(0xeb, 0xeb, 0xeb);
         static readonly Color CloseHot = Color.FromArgb(0xda, 0x37, 0x3c);
         /// <summary>Right-click on the bar; carries the screen position for the window menu.</summary>
         public event EventHandler<MouseEventArgs> MenuRequested;
@@ -31,7 +30,6 @@ namespace Spotipaq
         public TitleBar(Form form)
         {
             _form = form;
-            _form.TextChanged += delegate { Invalidate(); };      // the title follows the window text (artist - song)
             Height = 24;
             Dock = DockStyle.Top;
             SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer |
@@ -46,15 +44,13 @@ namespace Spotipaq
             Graphics g = e.Graphics;
             using (SolidBrush b = new SolidBrush(BarColor)) g.FillRectangle(b, ClientRectangle);
 
-            int textX = 8;
             if (AppIcon.Small != IntPtr.Zero)
             {
                 IntPtr dc = g.GetHdc();
                 try { DrawIconEx(dc, 6, (TextH - 16) / 2, AppIcon.Small, 16, 16, 0, IntPtr.Zero, 3); }      // DI_NORMAL
                 finally { g.ReleaseHdc(dc); }
-                textX = 28;
             }
-            Theme.Draw(g, _form.Text, Theme.Normal, new Rectangle(textX, 0, Math.Max(10, Width - textX - 3 * BtnW - 8), TextH), TitleColor, Theme.LeftEllipsis);
+            // no text: the bar shows just the icon and the buttons (the window text still names the song on the taskbar)
 
             for (int i = 0; i < 3; i++)
             {
@@ -213,6 +209,17 @@ namespace Spotipaq
 
         public void SetCurrent(NavTarget t) { _current = t; Invalidate(); }
 
+        // the playlist the current song was started from: its name goes green, with a speaker while it is sounding
+        string _playingId; bool _playingNow;
+        public void SetPlaying(string playlistId, bool playing)
+        {
+            if (playlistId == _playingId && playing == _playingNow) return;
+            _playingId = playlistId; _playingNow = playing;
+            Invalidate();
+        }
+        static readonly Color RowActive = Color.FromArgb(42, 42, 42);       // the playlist whose page is open
+        static readonly Color RowHot = Color.FromArgb(31, 31, 31);          // under the pointer
+
         protected override void OnResize(EventArgs e) { base.OnResize(e); ClampScroll(); }
 
         int RowTop(int i) { return TopH + i * RowH - _scroll; }
@@ -258,18 +265,23 @@ namespace Spotipaq
         {
             Graphics g = e.Graphics;
             g.Clear(Theme.Sidebar);
+            Rectangle clip = e.ClipRectangle;            // hovering repaints a row or a pill, not the whole card
 
             // playlists
             for (int i = 0; i < _lists.Count; i++)
             {
                 int y = RowTop(i);
                 if (y + RowH < TopH || y > Height) continue;
+                if (y + RowH <= clip.Top || y >= clip.Bottom) continue;
                 Playlist p = _lists[i];
                 bool hot = _dragging ? i == _press : i == _hot;
-                if (hot) using (SolidBrush b = new SolidBrush(Theme.RowHover)) g.FillRectangle(b, 6, y, ViewW - 8, RowH);
-                Theme.Art(g, Images == null ? null : Images.Get(p.ImageUrl, ArtSize, ArtSize), new Rectangle(14, y + (RowH - ArtSize) / 2, ArtSize, ArtSize), false);
                 bool current = _current != null && _current.Kind == PageKind.Playlist && _current.Id == p.Id;
-                Theme.Text1(g, RowText(p), Theme.Normal, new Rectangle(14 + ArtSize + 10, y, ViewW - (14 + ArtSize + 10) - 8, RowH), current ? Theme.Accent : Theme.Text);
+                if (current || hot) Theme.FillRounded(g, new Rectangle(6, y + 1, ViewW - 8, RowH - 2), 4, current ? RowActive : RowHot);
+                Theme.Art(g, Images == null ? null : Images.Get(p.ImageUrl, ArtSize, ArtSize), new Rectangle(14, y + (RowH - ArtSize) / 2, ArtSize, ArtSize), false);
+                bool source = _playingId != null && _playingId == p.Id;
+                Rectangle sp = new Rectangle(ViewW - 8 - 24, y, 22, RowH);
+                bool speaker = source && _playingNow && (Glyphs.Draw(g, "ic_vol_fill", sp, Theme.Accent) || Glyphs.Draw(g, "ic_vol", sp, Theme.Accent));
+                Theme.Text1(g, RowText(p), Theme.Normal, new Rectangle(14 + ArtSize + 10, y, ViewW - (14 + ArtSize + 10) - 8 - (speaker ? 26 : 0), RowH), source ? Theme.Accent : Theme.Text);
             }
             if (_dragging && _drop >= 0)
             {
@@ -279,6 +291,7 @@ namespace Spotipaq
             _bar.Paint(g);
 
             // fixed top: covers whatever scrolled up under it
+            if (clip.Top >= TopH) { Theme.CardCorners(g, ClientRectangle, Theme.CardRadius, Theme.Window); return; }
             using (SolidBrush b = new SolidBrush(Theme.Sidebar)) g.FillRectangle(b, 0, 0, Width, TopH);
             bool libIcon = Glyphs.Draw(g, "ic_library", new Rectangle(14, 6, 22, HeaderH - 8), HeaderText);      // same place as Home's
             Theme.Text1(g, "Your Library", Theme.NormalBold, new Rectangle(libIcon ? 44 : 14, 6, ViewW - 50, HeaderH - 8), HeaderText);
@@ -297,6 +310,19 @@ namespace Spotipaq
             Theme.CardCorners(g, ClientRectangle, Theme.CardRadius, Theme.Window);      // the library is a rounded card
         }
 
+        void InvalidateRow(int i)
+        {
+            if (i < 0) return;
+            int top = Math.Max(TopH, RowTop(i)), bottom = RowTop(i) + RowH;
+            if (bottom > top) Invalidate(new Rectangle(0, top, Width, bottom - top));
+        }
+        void InvalidatePill(int i) { if (i >= 0) Invalidate(Rectangle.Inflate(PillRect(i), 1, 1)); }
+        void SetHot(int row, int pill)
+        {
+            if (row != _hot) { InvalidateRow(_hot); InvalidateRow(row); _hot = row; }
+            if (pill != _hotPill) { InvalidatePill(_hotPill); InvalidatePill(pill); _hotPill = pill; }
+        }
+
         protected override void OnMouseDown(MouseEventArgs e)
         {
             base.OnMouseDown(e);
@@ -313,7 +339,7 @@ namespace Spotipaq
         {
             if (_bar.MouseMove(e) && _press < 0)
             {
-                if (_hot != -1 || _hotPill != -1) { _hot = -1; _hotPill = -1; Invalidate(); }
+                SetHot(-1, -1);
                 Cursor = Cursors.Default;
                 base.OnMouseMove(e);
                 return;
@@ -331,16 +357,16 @@ namespace Spotipaq
                 }
             }
             int pill = PillAt(e.Location), row = pill < 0 ? RowAt(e.Y) : -1;
-            if (row != _hot || pill != _hotPill) { _hot = row; _hotPill = pill; Invalidate(); }
+            SetHot(row, pill);
             Cursor = row >= 0 || pill >= 0 ? Cursors.Hand : Cursors.Default;
             base.OnMouseMove(e);
         }
 
         protected override void OnMouseLeave(EventArgs e)
         {
-            _hot = -1; _hotPill = -1; _downPill = -1;
+            SetHot(-1, -1);
+            if (_downPill >= 0) { InvalidatePill(_downPill); _downPill = -1; }
             _bar.MouseLeave();
-            Invalidate();
             base.OnMouseLeave(e);
         }
 
@@ -577,16 +603,63 @@ namespace Spotipaq
         {
             Graphics g = e.Graphics;
             g.Clear(Theme.Window);
+            // Only what the repaint covers is drawn: the twice-a-second position update touches just the seek row.
+            Rectangle clip = e.ClipRectangle;
+            Color idle = Color.FromArgb(179, 179, 179);      // every control: grey at rest, white under the pointer
 
             if (Track != null)
             {
-                Theme.Art(g, Images == null ? null : Images.Get(Track.AlbumImageUrl, 56, 56), new Rectangle(10, 9, 56, 56), false);
-                LinkText(g, Track.Name, Theme.NormalBold, TitleRect, Theme.Text, _hot == "title");
-                LinkText(g, Track.ArtistName, Theme.BarArtist, ArtistRect, Theme.SubText, _hot == "artist");
+                if (clip.Left < 66 && clip.Top < 65)
+                    Theme.Art(g, Images == null ? null : Images.Get(Track.AlbumImageUrl, 56, 56), new Rectangle(10, 9, 56, 56), false);
+                if (clip.Left < TextRight && clip.Top < ArtistRect.Bottom)
+                {
+                    LinkText(g, Track.Name, Theme.NormalBold, TitleRect, Theme.Text, _hot == "title");
+                    LinkText(g, Track.ArtistName, Theme.BarArtist, ArtistRect, Theme.SubText, _hot == "artist");
+                }
             }
 
+            if (clip.Top < 44 && clip.Right > Cx - 110 && clip.Left < Cx + 110) PaintControls(g, idle);
+
+            // seek bar + times
+            Rectangle s = SeekRect;
+            if (clip.Bottom > s.Top - 4)
+            {
+                int dur = Track == null ? 0 : Track.DurationMs;
+                int pos = _dragSeek ? _dragMs : PositionMs;
+                Theme.Draw(g, Theme.Time(pos), Theme.Small, new Rectangle(s.Left - 50, s.Top - 2, 44, 18), Theme.SubText, TextFormatFlags.Right | TextFormatFlags.VerticalCenter);
+                Theme.Draw(g, Theme.Time(dur), Theme.Small, new Rectangle(s.Right + 6, s.Top - 2, 44, 18), Theme.SubText, TextFormatFlags.Left | TextFormatFlags.VerticalCenter);
+                Bar(g, s, dur <= 0 ? 0 : (float)pos / dur, _hot == "seek" || _dragSeek);
+            }
+
+            // volume
+            Rectangle v = VolRect;
+            if (clip.Top < v.Bottom + 6 && clip.Right > MuteRect.Left - 2)
+            {
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+                Color cMute = _hot == "mute" ? Color.White : idle;
+                if (!Glyphs.Draw(g, Volume <= 0 ? "ic_mute" : "ic_vol", MuteRect, cMute)) SpeakerGlyph(g, MuteRect, cMute, Volume <= 0);
+                g.SmoothingMode = SmoothingMode.None;
+                Bar(g, v, Volume / 100f, _hot == "vol" || _dragVol);
+            }
+        }
+
+        int _seekSec = -1, _seekFx = -1;
+        /// <summary>The position moved and nothing else did: repaints the seek row, and only if it would look different
+        /// (the time text shows whole seconds, the bar whole pixels).</summary>
+        public void InvalidateSeek()
+        {
+            Rectangle s = SeekRect;
+            int dur = Track == null ? 0 : Track.DurationMs;
+            int sec = PositionMs / 1000, fx = dur <= 0 ? 0 : (int)((long)s.Width * Math.Max(0, Math.Min(PositionMs, dur)) / dur);
+            if (sec == _seekSec && fx == _seekFx) return;
+            _seekSec = sec; _seekFx = fx;
+            Invalidate(new Rectangle(s.Left - 52, s.Top - 4, s.Width + 104, 22));
+        }
+
+        // previous / play / next, shuffle, repeat
+        void PaintControls(Graphics g, Color idle)
+        {
             g.SmoothingMode = SmoothingMode.AntiAlias;
-            Color idle = Color.FromArgb(179, 179, 179);      // every control: grey at rest, white under the pointer
             // play / pause: white outlined circle (1.0 style)
             // play / pause: a solid white disc, always white; it grows by a pixel all round under the pointer
             Rectangle disc = PlayRect;
@@ -607,22 +680,6 @@ namespace Spotipaq
             if (!Glyphs.Draw(g, "ic_shuffle", ShuffleRect, cShuffle)) ShuffleGlyph(g, ShuffleRect, cShuffle);
             if (!Glyphs.Draw(g, RepeatMode == 2 ? "ic_repeat1" : "ic_repeat", RepeatRect, cRepeat)) RepeatGlyph(g, RepeatRect, RepeatMode, cRepeat);
             g.SmoothingMode = SmoothingMode.None;
-
-            // seek bar + times
-            Rectangle s = SeekRect;
-            int dur = Track == null ? 0 : Track.DurationMs;
-            int pos = _dragSeek ? _dragMs : PositionMs;
-            Theme.Draw(g, Theme.Time(pos), Theme.Small, new Rectangle(s.Left - 50, s.Top - 2, 44, 18), Theme.SubText, TextFormatFlags.Right | TextFormatFlags.VerticalCenter);
-            Theme.Draw(g, Theme.Time(dur), Theme.Small, new Rectangle(s.Right + 6, s.Top - 2, 44, 18), Theme.SubText, TextFormatFlags.Left | TextFormatFlags.VerticalCenter);
-            Bar(g, s, dur <= 0 ? 0 : (float)pos / dur, _hot == "seek" || _dragSeek);
-
-            // volume
-            Rectangle v = VolRect;
-            g.SmoothingMode = SmoothingMode.AntiAlias;
-            Color cMute = _hot == "mute" ? Color.White : idle;
-            if (!Glyphs.Draw(g, Volume <= 0 ? "ic_mute" : "ic_vol", MuteRect, cMute)) SpeakerGlyph(g, MuteRect, cMute, Volume <= 0);
-            g.SmoothingMode = SmoothingMode.None;
-            Bar(g, v, Volume / 100f, _hot == "vol" || _dragVol);
         }
 
         static void LinkText(Graphics g, string text, Font f, Rectangle r, Color c, bool hot)
