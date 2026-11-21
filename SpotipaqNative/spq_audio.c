@@ -5,9 +5,12 @@
  * bytes in with spq_audio_feed() (decrypted here); a decoder thread demuxes Ogg, decodes Vorbis (spq_vorbis.c,
  * x87 floats only - no SSE, this runs on a Pentium II) and plays through waveOut. One stream at a time.
  *
- * The decoder runs up to 1.5 s ahead into a ring of 16-bit samples; only about 0.1 s of that is handed to waveOut
- * at any time. Volume and fades are applied on the way from the ring to the device, so they are heard within
- * that 0.1 s: pause / resume fade over 333 ms, a stream starts with a 166 ms fade-in and a stopped one fades out
+ * Two threads per stream. The decoder runs up to 1.5 s ahead into a ring of 16-bit samples. The feeder hands the
+ * device about 0.14 s of that at a time; it does almost no work (a copy and a gain), so it can run at time-critical
+ * priority without hurting anything, and nothing the UI does can make it late - while the decoder, which does the
+ * real work at a modest priority, has the whole ring as a cushion when the UI is busy. (As one thread just above
+ * normal priority, a burst of repainting could hold the audio up longer than the device had queued: stutter.)
+ * Volume and fades are applied by the feeder, on the way from the ring to the device, so they are heard at once: pause / resume fade over 333 ms, a stream starts with a 166 ms fade-in and a stopped one fades out
  * over 166 ms (on its own, after spq_audio_stop has already returned - the next track can be opening meanwhile).
  */
 #define WIN32_LEAN_AND_MEAN
@@ -41,16 +44,20 @@ typedef struct {
     uint8_t* buf; size_t total; volatile size_t filled;
     AES_KEY aes; uint8_t iv[16], ecount[16]; unsigned int num;
 
-    HANDLE thread, ev_data, ev_cmd, ev_wave, ev_faded;
+    HANDLE thread, feeder, ev_data, ev_cmd, ev_wave, ev_faded, ev_room, ev_flushed;
     volatile LONG stop, paused, seek_ms, buffering, ended, error, volume, start_ms, pos_base_ms;
     volatile LONG fade_to, fade_ms;          /* 1 = audible, 0 = silent; how long the way there takes */
     volatile LONG dying;                     /* stopped: fade out, then the reaper frees the session */
 
     HWAVEOUT hwo; WAVEHDR hdr[NBUF]; short* pcm[NBUF]; int busy[NBUF]; int queued;
-    short* ring; int rr, rcount;             /* interleaved stereo; read index and frames waiting */
+    /* The ring: interleaved stereo. One writer (decoder) and one reader (feeder), no lock: each side only ever
+     * changes its own counter. The counters are frames since the stream opened; they wrap, their difference doesn't. */
+    short* ring; volatile LONG wpos, rpos;
+    volatile LONG flush_req;                 /* decoder -> feeder: drop everything queued and decoded (a seek) */
+    /* feeder only: */
     int fade;                                /* current fade gain, 0 .. FADE_ONE */
     int vg;                                  /* current volume gain (Q15), gliding towards the set volume; -1 = not set yet */
-    int eof;                                 /* the decoder has reached the end of the stream */
+    volatile LONG eof;                       /* the decoder has reached the end of the stream */
     int rate, channels;
 
     ogg_reader og; vorbis_dec* vd;
@@ -114,17 +121,22 @@ static __inline short to_s16(float v)
     { int r = u.i - 0x4B400000; return (short)(r > 32767 ? 32767 : r < -32768 ? -32768 : r); }
 }
 
-/* Appends frames [from, n) of the decoded block to the ring (the caller has made sure there is room). */
+static __inline int ring_avail(Sess* s) { return (int)((unsigned)s->wpos - (unsigned)s->rpos); }
+
+/* Decoder: appends frames [from, n) of the decoded block to the ring (the caller has made sure there is room;
+ * only the feeder changes how much room there is, and only upwards). */
 static void ring_write(Sess* s, float** pcm, int from, int n)
 {
     const float* l = pcm[0], * r = s->channels > 1 ? pcm[1] : pcm[0];
-    int w = (s->rr + s->rcount) & RING_MASK, i;
+    LONG pos = s->wpos;
+    int w = (int)((unsigned)pos & RING_MASK), i;
     for (i = from; i < n; i++) {
         short* o = s->ring + w * 2;
         o[0] = to_s16(l[i] * 32767.0f); o[1] = to_s16(r[i] * 32767.0f);
         w = (w + 1) & RING_MASK;
     }
-    s->rcount += n - from;
+    InterlockedExchange(&s->wpos, pos + (n - from));     /* published only once the samples are in place */
+    SetEvent(s->ev_wave);                                /* the feeder may be waiting for them */
 }
 
 static void reclaim(Sess* s)
@@ -143,10 +155,12 @@ static int render(Sess* s, short* out, int take)
 {
     int vol = (int)s->volume, vg = vol * vol * 32768 / 10000;       /* Q15, squared for a natural volume curve */
     int target = s->fade_to ? FADE_ONE : 0, done = 0;
+    LONG rpos = s->rpos;
+    int rr = (int)((unsigned)rpos & RING_MASK);
     if (s->vg < 0) s->vg = vg;                                      /* first buffer: start at the set volume */
     while (done < take) {
-        int seg = RING_FRAMES - s->rr, used = 0, k;
-        const short* in = s->ring + s->rr * 2;
+        int seg = RING_FRAMES - rr, used = 0, k;
+        const short* in = s->ring + rr * 2;
         short* o = out + done * 2;
         if (seg > take - done) seg = take - done;
         if (s->fade == target && s->vg == vg) {                     /* steady: the usual case */
@@ -174,8 +188,9 @@ static int render(Sess* s, short* out, int take)
             s->fade = f; s->vg = v;
             if (f == 0 && target == 0) s->vg = vg;
         }
-        s->rr = (s->rr + used) & RING_MASK; s->rcount -= used; done += used;
+        rr = (rr + used) & RING_MASK; done += used;
     }
+    if (done > 0) InterlockedExchange(&s->rpos, rpos + done);
     return done;
 }
 
@@ -185,8 +200,9 @@ static int pump(Sess* s)
     int wrote = 0;
     if (!s->hwo) return 0;
     reclaim(s);
-    while (s->queued < QUEUE && s->rcount > 0 && !held(s)) {
-        int i, n, take = s->rcount < OUT_FRAMES ? s->rcount : OUT_FRAMES;
+    while (s->queued < QUEUE && !held(s)) {
+        int i, n, have = ring_avail(s), take = have < OUT_FRAMES ? have : OUT_FRAMES;
+        if (take <= 0) break;
         if (take < OUT_FRAMES && !s->eof && s->fade_to) break;      /* wait for a full buffer, except at the end or while fading out */
         for (i = 0; i < NBUF; i++) if (!s->busy[i]) break;
         if (i == NBUF) break;
@@ -198,7 +214,37 @@ static int pump(Sess* s)
         waveOutWrite(s->hwo, &s->hdr[i], sizeof(WAVEHDR));
         wrote = 1;
     }
+    if (wrote) SetEvent(s->ev_room);                     /* the decoder may be waiting for room */
     return wrote;
+}
+
+/* Feeder thread: keeps the device supplied from the ring. Owns the device queue, the fade and the volume glide. */
+static DWORD WINAPI feed_thread(LPVOID arg)
+{
+    Sess* s = (Sess*)arg;
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    while (!s->stop) {
+        int i, idle = 0;
+        if (s->flush_req) {                              /* a seek: drop what is queued and what is decoded */
+            waveOutReset(s->hwo);
+            for (i = 0; i < NBUF; i++) s->busy[i] = 0;
+            s->queued = 0;
+            InterlockedExchange(&s->rpos, s->wpos);      /* the decoder is waiting for us, so wpos is not moving */
+            s->fade = 0;                                 /* comes back in with a fade instead of a click (or stays silent, if paused) */
+            InterlockedExchange(&s->flush_req, 0);
+            SetEvent(s->ev_flushed);
+        }
+        pump(s);
+        if (s->queued == 0 && ring_avail(s) == 0) {
+            if (!s->fade_to && s->fade) s->fade = 0;     /* paused with nothing left to fade: silent already */
+            if (s->eof && !s->flush_req && !s->ended) InterlockedExchange(&s->ended, 1);
+            idle = 1;
+        }
+        if (held(s)) idle = 1;                           /* paused, or a stopped stream whose fade-out is done */
+        if (s->dying && s->queued == 0 && (held(s) || ring_avail(s) == 0)) SetEvent(s->ev_faded);      /* tell the reaper */
+        WaitForSingleObject(s->ev_wave, idle ? 200 : 40);
+    }
+    return 0;
 }
 
 /* ------------------------------------------------------------------ seeking */
@@ -211,10 +257,13 @@ static void do_seek(Sess* s, int ms)
 {
     int64_t T = (int64_t)ms * s->rate / 1000, base = 0;
     int i, best, j;
-    if (s->hwo) waveOutReset(s->hwo);
-    for (i = 0; i < NBUF; i++) s->busy[i] = 0;
-    s->queued = 0; s->rr = 0; s->rcount = 0; s->eof = 0;
-    s->fade = 0;                                         /* comes back in with a fade instead of a click (or stays silent, if paused) */
+    /* the feeder owns the device and the read side of the ring: have it drop everything, and wait until it has */
+    InterlockedExchange(&s->eof, 0);
+    if (s->feeder) {
+        InterlockedExchange(&s->flush_req, 1);
+        SetEvent(s->ev_wave);
+        while (s->flush_req && !s->stop) WaitForSingleObject(s->ev_flushed, 50);
+    }
     InterlockedExchange(&s->ended, 0);
     InterlockedExchange(&s->pos_base_ms, ms);
     for (;;) {
@@ -229,7 +278,7 @@ static void do_seek(Sess* s, int ms)
         while (j < s->npages && (s->pages[j].hdr & 1)) j++;
         if (beyond&& j < s->npages) break;
         if (s->filled >= s->total) {                     /* whole file here */
-            if (j >= s->npages) { s->eof = 1; return; }      /* past the end: nothing to play, the main loop reports it */
+            if (j >= s->npages) { InterlockedExchange(&s->eof, 1); SetEvent(s->ev_wave); return; }      /* past the end: nothing to play, the main loop reports it */
             break;
         }
         if (!wait_data(s)) return;                       /* new command arrived; caller re-dispatches */
@@ -282,15 +331,19 @@ static DWORD WINAPI dec_thread(LPVOID arg)
     }
     s->rate = vd_rate(s->vd); s->channels = vd_channels(s->vd);
     if (!open_wave(s)) { InterlockedExchange(&s->error, 1); goto done; }
+    s->feeder = CreateThread(NULL, 0, feed_thread, s, 0, NULL);
+    if (!s->feeder) { InterlockedExchange(&s->error, 1); goto done; }
     s->scan_pos = s->og.pos;                             /* first audio page */
     if (s->start_ms > 0) { InterlockedExchange(&s->seek_ms, s->start_ms); SetEvent(s->ev_cmd); }
     InterlockedExchange(&s->buffering, 0);
-    ev[0] = s->ev_wave; ev[1] = s->ev_cmd; ev[2] = s->ev_data;
+    ev[0] = s->ev_room; ev[1] = s->ev_cmd; ev[2] = s->ev_data;
 
     while (!s->stop) {
-        int progressed, idle = 0;
+        int progressed = 0;
 
-        if (s->seek_ms >= 0 && !s->dying) {
+        if (s->dying) { WaitForSingleObject(s->ev_cmd, 100); continue; }      /* stopped: the feeder is fading it out, nothing more to decode */
+
+        if (s->seek_ms >= 0) {
             LONG ms = InterlockedExchange(&s->seek_ms, -1);
             do_seek(s, (int)ms);
             InterlockedExchange(&s->buffering, 0);
@@ -298,24 +351,15 @@ static DWORD WINAPI dec_thread(LPVOID arg)
             continue;
         }
 
-        progressed = pump(s);                            /* ring -> device, with volume and fades */
-        if (!s->fade_to && s->fade && s->rcount == 0 && s->queued == 0) s->fade = 0;      /* paused with nothing left to fade: silent already */
-
-        if (s->dying) {                                  /* stopped: once the fade-out has played, tell the reaper */
-            if (s->queued == 0 && (held(s) || s->rcount == 0)) { SetEvent(s->ev_faded); idle = 1; }
-        }
-        else if (s->eof) {
-            if (s->rcount == 0 && s->queued == 0) { if (!s->ended) InterlockedExchange(&s->ended, 1); idle = 1; }
-        }
-        else if (RING_FRAMES - s->rcount >= MAX_OUT) {   /* room for one more packet: decode -> ring */
+        if (!s->eof && RING_FRAMES - ring_avail(s) >= MAX_OUT) {     /* room for one more packet: decode -> ring */
             const uint8_t* p; int len, eos, r, n; int64_t g; float** pcm;
             s->og.avail = avail_bytes(s);
             r = og_next(&s->og, &p, &len, &g, &eos);
             if (r == 0) {
-                if (s->filled >= s->total) s->eof = 1;                                /* whole file decoded */
-                else if (s->rcount == 0 && s->queued == 0) InterlockedExchange(&s->buffering, 1);   /* run dry: waiting for the download */
+                if (s->filled >= s->total) { InterlockedExchange(&s->eof, 1); SetEvent(s->ev_wave); }      /* whole file decoded */
+                else if (ring_avail(s) == 0) InterlockedExchange(&s->buffering, 1);                         /* run dry: waiting for the download */
             }
-            else if (r < 0) s->eof = 1;
+            else if (r < 0) { InterlockedExchange(&s->eof, 1); SetEvent(s->ev_wave); }
             else {
                 InterlockedExchange(&s->buffering, 0);
                 if (vd_decode(s->vd, p, len, &pcm, &n) != 0) { if (++errors > 200) { InterlockedExchange(&s->error, 1); break; } }
@@ -326,20 +370,19 @@ static DWORD WINAPI dec_thread(LPVOID arg)
                         if (s->discard > 0) { skip = s->discard >= n ? n : (int)s->discard; s->discard -= skip; }
                         if (skip < n) ring_write(s, pcm, skip, n);
                     }
-                    if (eos) s->eof = 1;
+                    if (eos) { InterlockedExchange(&s->eof, 1); SetEvent(s->ev_wave); }
                 }
-                /* Far enough ahead: one packet per device buffer is plenty, so wait for the device instead of
+                /* Far enough ahead: one packet per device buffer is plenty, so wait for the feeder instead of
                  * racing to fill the ring (that burst is what made the UI stutter when a track started). */
-                if (s->rcount < PACE_FRAMES) progressed = 1;
+                if (ring_avail(s) < PACE_FRAMES) progressed = 1;
             }
         }
-        if (held(s) && !s->dying) idle = 1;              /* paused */
 
-        if (!progressed) WaitForMultipleObjects(3, ev, FALSE, idle ? 200 : 40);
+        if (!progressed) WaitForMultipleObjects(3, ev, FALSE, 40);
     }
 
 done:
-    if (s->ev_faded) SetEvent(s->ev_faded);
+    if (s->ev_faded && !s->feeder) SetEvent(s->ev_faded);      /* never got as far as playing: nothing to fade */
     return 0;
 }
 
@@ -352,7 +395,10 @@ static void sess_destroy(Sess* s)
     if (s->ev_cmd) SetEvent(s->ev_cmd);
     if (s->ev_data) SetEvent(s->ev_data);
     if (s->ev_wave) SetEvent(s->ev_wave);
+    if (s->ev_room) SetEvent(s->ev_room);
+    if (s->ev_flushed) SetEvent(s->ev_flushed);
     if (s->thread) { WaitForSingleObject(s->thread, 5000); CloseHandle(s->thread); }
+    if (s->feeder) { SetEvent(s->ev_wave); WaitForSingleObject(s->feeder, 5000); CloseHandle(s->feeder); }
     if (s->hwo) {
         waveOutReset(s->hwo);
         for (i = 0; i < NBUF; i++) waveOutUnprepareHeader(s->hwo, &s->hdr[i], sizeof(WAVEHDR));
@@ -363,6 +409,8 @@ static void sess_destroy(Sess* s)
     og_free(&s->og);
     free(s->pages); free(s->buf); free(s->ring);
     if (s->ev_faded) CloseHandle(s->ev_faded);
+    if (s->ev_room) CloseHandle(s->ev_room);
+    if (s->ev_flushed) CloseHandle(s->ev_flushed);
     if (s->ev_data) CloseHandle(s->ev_data);
     if (s->ev_cmd) CloseHandle(s->ev_cmd);
     if (s->ev_wave) CloseHandle(s->ev_wave);
@@ -390,7 +438,7 @@ SPQ_API void __cdecl spq_audio_stop(void)
     InterlockedExchange(&s->fade_ms, FADE_TRACK_MS);
     InterlockedExchange(&s->fade_to, 0);
     InterlockedExchange(&s->dying, 1);
-    SetEvent(s->ev_cmd);
+    SetEvent(s->ev_cmd); SetEvent(s->ev_wave);
     h = CreateThread(NULL, 0, reaper, s, 0, NULL);
     if (h) CloseHandle(h); else sess_destroy(s);
 }
@@ -414,6 +462,8 @@ SPQ_API int __cdecl spq_audio_open(const unsigned char* key, int total)
     s->fade = 0; s->fade_to = 1; s->fade_ms = FADE_TRACK_MS;     /* a new track fades in */
     s->vg = -1;
     s->ev_faded = CreateEvent(NULL, FALSE, FALSE, NULL);
+    s->ev_room = CreateEvent(NULL, FALSE, FALSE, NULL);
+    s->ev_flushed = CreateEvent(NULL, FALSE, FALSE, NULL);
     s->ev_data = CreateEvent(NULL, FALSE, FALSE, NULL);
     s->ev_cmd = CreateEvent(NULL, FALSE, FALSE, NULL);
     s->ev_wave = CreateEvent(NULL, FALSE, FALSE, NULL);
@@ -466,7 +516,7 @@ SPQ_API void __cdecl spq_audio_pause(int paused)
         InterlockedExchange(&s->paused, paused ? 1 : 0);
         InterlockedExchange(&s->fade_ms, FADE_PAUSE_MS);
         InterlockedExchange(&s->fade_to, paused ? 0 : 1);
-        SetEvent(s->ev_cmd);
+        SetEvent(s->ev_wave);                            /* the feeder does the fading */
     }
     LeaveCriticalSection(&g_cs);
 }

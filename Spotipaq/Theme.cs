@@ -407,7 +407,7 @@ namespace Spotipaq
         long _memoryBytes;
         int _writesSinceTrim;
 
-        sealed class ArtRequest { public string Url; public int Width; public int Height; public string Key; }
+        sealed class ArtRequest { public string Url; public int Width; public int Height; public string Key; public bool FromTop; }
 
         public ImageCache(ISpotifyBackend backend, Control ui)
         {
@@ -422,10 +422,14 @@ namespace Spotipaq
         }
 
         /// <summary>Never accesses disk, decodes or scales on the UI thread.</summary>
-        public Bitmap Get(string url, int w, int h)
+        public Bitmap Get(string url, int w, int h) { return Get(url, w, h, false); }
+
+        /// <summary>fromTop: when the picture is taller than the box, keep its top and cut the bottom (banners),
+        /// instead of cutting both ends equally.</summary>
+        public Bitmap Get(string url, int w, int h, bool fromTop)
         {
             if (String.IsNullOrEmpty(url) || w <= 0 || h <= 0) return null;
-            string key = url + "@" + w + "x" + h;
+            string key = url + "@" + w + "x" + h + (fromTop ? "t" : "");
             Bitmap bmp;
             if (_scaled.TryGetValue(key, out bmp))
             {
@@ -442,7 +446,7 @@ namespace Spotipaq
                 if (!_requested.ContainsKey(key))
                 {
                     _requested[key] = true;
-                    _queue.Enqueue(new ArtRequest { Url = url, Width = w, Height = h, Key = key });
+                    _queue.Enqueue(new ArtRequest { Url = url, Width = w, Height = h, Key = key, FromTop = fromTop });
                     Monitor.Pulse(_lock);
                 }
             }
@@ -487,7 +491,7 @@ namespace Spotipaq
             }
         }
 
-        static Bitmap Scale(Bitmap src, int w, int h)
+        static Bitmap Scale(Bitmap src, int w, int h, bool fromTop)
         {
             Bitmap dst = new Bitmap(w, h, PixelFormat.Format32bppPArgb);
             using (Graphics g = Graphics.FromImage(dst))
@@ -496,7 +500,7 @@ namespace Spotipaq
                 g.PixelOffsetMode = PixelOffsetMode.HighQuality;
                 float sa = (float)src.Width / src.Height, da = (float)w / h;
                 RectangleF from = sa > da ? new RectangleF((src.Width - src.Height * da) / 2, 0, src.Height * da, src.Height)
-                                          : new RectangleF(0, (src.Height - src.Width / da) / 2, src.Width, src.Width / da);
+                                          : new RectangleF(0, fromTop ? 0 : (src.Height - src.Width / da) / 2, src.Width, src.Width / da);
                 g.DrawImage(src, new Rectangle(0, 0, w, h), from, GraphicsUnit.Pixel);
             }
             if (w != h) return dst;                    // banners stay square-cornered
@@ -571,7 +575,7 @@ namespace Spotipaq
                     }
                     if (original != null)
                     {
-                        using (original) result = Scale(original, req.Width, req.Height);
+                        using (original) result = Scale(original, req.Width, req.Height, req.FromTop);
                     }
                 }
                 catch (Exception ex) { Spotipaq.Engine.Log.Write("Artwork load failed: " + ex.Message); }

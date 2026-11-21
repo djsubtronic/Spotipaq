@@ -1274,8 +1274,13 @@ namespace Spotipaq
             shuffle.On = delegate { return _shuffle; };
             buttons.Add(shuffle);
             if (!_libraryIds.ContainsKey(p.Id)) buttons.Add(new PageButton("SAVE", false, 100, delegate { SavePlaylistToLibrary(p); }));
-            b.Add(new HeaderBlock("PLAYLIST", p.Name, p.Description, OwnerName(p), null,
-                new string[] { SongCount(p.Tracks) }, ", " + Duration(p.Tracks), p.ImageUrl, buttons));
+            bool madeFor = !String.IsNullOrEmpty(p.MadeFor);
+            HeaderBlock head = new HeaderBlock("PLAYLIST", p.Name, p.Description, madeFor ? p.MadeFor : OwnerName(p), null,
+                new string[] { SongCount(p.Tracks) }, ", " + Duration(p.Tracks), p.ImageUrl, buttons);
+            head.BannerUrl = p.HeaderImageUrl;           // radios, mixes, "This Is": the wide banner header
+            try { if (!String.IsNullOrEmpty(p.Color)) head.Key = ColorTranslator.FromHtml(p.Color); } catch (Exception) { }      // Spotify's own colour for the page
+            if (madeFor) head.ByPrefix = "Made for ";
+            b.Add(head);
             b.Add(new TrackListBlock(p.Tracks, TrackColumns.Number | TrackColumns.Artist | TrackColumns.Album | TrackColumns.Art | TrackColumns.Search, true));
             return b;
         }

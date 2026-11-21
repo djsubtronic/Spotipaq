@@ -55,6 +55,15 @@ namespace Spotipaq
         public virtual int PinHeight { get { return 0; } }
         /// <summary>Paints the pinned strip at r (screen coordinates).</summary>
         public virtual void PaintPinned(Graphics g, Rectangle r, PageView view) { }
+        /// <summary>How far above its own top the block paints (a banner that runs up behind the page's top bar).</summary>
+        public virtual int Bleed { get { return 0; } }
+        /// <summary>For the block that gives the page its key colour: where the header ends and the darker wash under
+        /// it begins, in block coordinates (see PageView's "colour wash"). -1 = the plain older look: one fade from
+        /// the top of the page.</summary>
+        public virtual int WashTop { get { return -1; } }
+        /// <summary>The page's key colour if it is known outright (Spotify's own pick for the cover); Empty = work it
+        /// out from KeyImageUrl.</summary>
+        public virtual Color KeyColor { get { return Color.Empty; } }
         /// <summary>Drops the block's selection (a clicked row), if it has one. True = it had one, repaint.</summary>
         public virtual bool ClearSelection() { return false; }
     }
@@ -128,20 +137,14 @@ namespace Spotipaq
         bool SearchHasText { get { return _searchBlock != null && InputText(_searchBlock).Length > 0; } }
 
         int HeaderAlpha { get { return _scroll <= 0 ? 0 : _scroll >= _solidAt ? 255 : (int)(255L * _scroll / _solidAt); } }
-        Color HeaderColor { get { return _haveKey ? _key : Color.FromArgb(32, 32, 32); } }
+        Color HeaderColor { get { return !_haveKey ? Color.FromArgb(32, 32, 32) : Modern ? Shade(_key, 40) : Shade(_key, 69); } }
 
         /// <summary>The colour of the search box: what is behind it (the gradient, under however much of the bar has
         /// faded in), lightened a little - what a translucent white box would look like. The text box uses it too.</summary>
         Color SearchBack()
         {
-            Color under = Theme.Main;
             Rectangle box = SearchRect;
-            int y = box.Top + box.Height / 2 + _scroll;
-            if (_haveKey && y < GradH)
-            {
-                double t = Math.Max(0, y) / (double)GradH;
-                under = Color.FromArgb((int)(_key.R + (Theme.Main.R - _key.R) * t), (int)(_key.G + (Theme.Main.G - _key.G) * t), (int)(_key.B + (Theme.Main.B - _key.B) * t));
-            }
+            Color under = WashAt(box.Top + box.Height / 2 + _scroll);
             int a = box.Top < HeaderH ? HeaderAlpha : 0; Color bar = HeaderColor;      // the bar only counts once the box is in it
             under = Color.FromArgb(under.R + (bar.R - under.R) * a / 255, under.G + (bar.G - under.G) * a / 255, under.B + (bar.B - under.B) * a / 255);
             return Color.FromArgb(under.R + (255 - under.R) / 10, under.G + (255 - under.G) / 10, under.B + (255 - under.B) / 10);
@@ -152,6 +155,7 @@ namespace Spotipaq
         {
             if (!SearchShown) return;
             Rectangle s = SearchRect;
+            if (!g.IsVisible(s)) return;                 // a partial repaint elsewhere (hovering rows): nothing to do
             Theme.FillRounded(g, s, 4, SearchBack());
             g.SmoothingMode = SmoothingMode.AntiAlias;
             using (Pen lens = new Pen(SearchSoft, 1.6f))
@@ -228,7 +232,9 @@ namespace Spotipaq
 
         void EnsureKey()
         {
-            if (_haveKey || _keyUrl == null) return;
+            if (_haveKey) return;
+            if (_keyBlock != null && !_keyBlock.KeyColor.IsEmpty) { _key = _keyBlock.KeyColor; _haveKey = true; DropGradient(); return; }
+            if (_keyUrl == null) return;
             Bitmap bmp = _host.Images.Get(_keyUrl, 16, 16);      // null while loading: the cache repaints us when it arrives
             if (bmp == null) return;
             double r = 0, g = 0, b = 0; int n = 0;
@@ -247,29 +253,84 @@ namespace Spotipaq
             r /= n; g /= n; b /= n;
             double mean = (r + g + b) / 3;                       // a little more saturated than the plain average...
             r = Math.Max(0, mean + (r - mean) * 1.3); g = Math.Max(0, mean + (g - mean) * 1.3); b = Math.Max(0, mean + (b - mean) * 1.3);
-            double k = 96.0 / Math.Max(1.0, Math.Max(r, Math.Max(g, b)));      // ...and always dark: brightest channel 96
+            double k = 140.0 / Math.Max(1.0, Math.Max(r, Math.Max(g, b)));     // ...at a fixed strength: brightest channel 140, about what Spotify's own picks have
             _key = Color.FromArgb(Math.Min(255, (int)(r * k)), Math.Min(255, (int)(g * k)), Math.Min(255, (int)(b * k)));
             _haveKey = true;
             DropGradient();
         }
 
+        // The colour wash behind the top of the page, the way Spotify's client does it from one key colour:
+        //   - behind the header: the key colour at the top, darkening to half by the header's bottom edge
+        //     (a banner header covers this part with its picture, darkened the same way);
+        //   - below the header: a darker shade (40%) fading out to the page colour over 232 px - the buttons, the
+        //     column headers and the first rows sit on this;
+        //   - the top bar, once scrolled: that same 40% shade.
+        // Pages whose header doesn't say where it ends (artist) keep the plain older look: one fade from the top.
+        Block _keyBlock;
+        const int WashH = 232;
+        bool Modern { get { return _keyBlock != null && _keyBlock.WashTop >= 0; } }
+        int WashTop { get { return Modern ? _keyBlock.Top + _keyBlock.WashTop : 0; } }
+        static Color Shade(Color c, int percent) { return Color.FromArgb(c.R * percent / 100, c.G * percent / 100, c.B * percent / 100); }
+        static Color Mix(Color a, Color b, double t)
+        {
+            if (t < 0) t = 0; else if (t > 1) t = 1;
+            return Color.FromArgb((int)(a.R + (b.R - a.R) * t), (int)(a.G + (b.G - a.G) * t), (int)(a.B + (b.B - a.B) * t));
+        }
+        /// <summary>The wash's colour at a page y (the page colour below it).</summary>
+        Color WashAt(int y)
+        {
+            if (!_haveKey) return Theme.Main;
+            if (!Modern) return Mix(Shade(_key, 69), Theme.Main, y / (double)GradH);
+            int top = WashTop;
+            if (y < top) return Mix(_key, Shade(_key, 50), y / (double)Math.Max(1, top));
+            return Mix(Shade(_key, 40), Theme.Main, (y - top) / (double)WashH);
+        }
+
         void PaintGradient(Graphics g)
         {
-            if (!_haveKey || _scroll >= GradH) return;
+            if (!_haveKey) return;
+            bool modern = Modern;
+            int top = WashTop, gh = modern ? top + WashH : GradH;
+            if (_scroll >= gh) return;
             int w = Math.Max(64, (ClientSize.Width + 63) / 64 * 64);      // 64 px steps: resizing doesn't rebuild it every pixel
-            if (_grad == null || _grad.Width != w)
+            if (_grad == null || _grad.Width != w || _grad.Height != gh)
             {
                 DropGradient();
-                _grad = new Bitmap(w, GradH, System.Drawing.Imaging.PixelFormat.Format32bppRgb);
+                _grad = new Bitmap(w, gh, System.Drawing.Imaging.PixelFormat.Format32bppRgb);
                 using (Graphics bg = Graphics.FromImage(_grad))
-                using (LinearGradientBrush lb = new LinearGradientBrush(new Rectangle(0, -1, w, GradH + 2), _key, Theme.Main, LinearGradientMode.Vertical))
-                    bg.FillRectangle(lb, 0, 0, w, GradH);
+                {
+                    if (!modern) Fade(bg, 0, gh, w, Shade(_key, 69), Theme.Main);
+                    else
+                    {
+                        if (top > 0) Fade(bg, 0, top, w, _key, Shade(_key, 50));
+                        Fade(bg, top, WashH, w, Shade(_key, 40), Theme.Main);
+                    }
+                }
             }
             // opaque and unscaled: a straight copy, no blending or filtering
             CompositingMode cm = g.CompositingMode; InterpolationMode im = g.InterpolationMode;
             g.CompositingMode = CompositingMode.SourceCopy; g.InterpolationMode = InterpolationMode.NearestNeighbor;
             g.DrawImage(_grad, 0, -_scroll, _grad.Width, _grad.Height);
             g.CompositingMode = cm; g.InterpolationMode = im;
+        }
+        /// <summary>Paints a strip of the control with exactly what the page's background is there right now - the
+        /// colour wash at the current scroll position, or the plain page colour past it. For things pinned over the
+        /// scrolling content (the column headers): they hide the rows passing behind without showing as a bar.</summary>
+        public void FillWash(Graphics g, Rectangle r)
+        {
+            using (SolidBrush b = new SolidBrush(Theme.Main)) g.FillRectangle(b, r);
+            int sy = r.Top + _scroll;
+            if (!_haveKey || _grad == null || sy >= _grad.Height || sy < 0) return;
+            int h = Math.Min(r.Height, _grad.Height - sy), w = Math.Min(r.Width, _grad.Width);
+            CompositingMode cm = g.CompositingMode; InterpolationMode im = g.InterpolationMode;
+            g.CompositingMode = CompositingMode.SourceCopy; g.InterpolationMode = InterpolationMode.NearestNeighbor;
+            g.DrawImage(_grad, new Rectangle(r.Left, r.Top, w, h), new Rectangle(r.Left, sy, w, h), GraphicsUnit.Pixel);
+            g.CompositingMode = cm; g.InterpolationMode = im;
+        }
+        static void Fade(Graphics g, int y, int h, int w, Color from, Color to)
+        {
+            using (LinearGradientBrush lb = new LinearGradientBrush(new Rectangle(0, y - 1, w, h + 2), from, to, LinearGradientMode.Vertical))
+                g.FillRectangle(lb, 0, y, w, h);
         }
 
         void PaintHeader(Graphics g)
@@ -333,8 +394,10 @@ namespace Spotipaq
             _blocks.Clear();
             _blocks.AddRange(blocks);
             string url = null;
-            foreach (Block b in _blocks) { url = b.KeyImageUrl; if (!String.IsNullOrEmpty(url)) break; url = null; }
-            if (url != _keyUrl) { _keyUrl = url; _haveKey = false; DropGradient(); }
+            _keyBlock = null;
+            foreach (Block b in _blocks) { url = b.KeyImageUrl; if (!String.IsNullOrEmpty(url)) { _keyBlock = b; break; } url = null; }
+            _keyUrl = url; _haveKey = false;             // worked out again for every page (cheap: the picture is cached)
+            DropGradient();
             _inputOwner = null; _inputWanted = false;                   // a new page: the search box starts empty and closed
             _searchBlock = null;
             foreach (Block b in _blocks) if (b.WantsSearch) { _searchBlock = b; break; }
@@ -379,7 +442,7 @@ namespace Spotipaq
             foreach (Block b in _blocks)
             {
                 Rectangle r = new Rectangle(0, b.Top - _scroll, _layoutWidth, b.Height);
-                if (r.Bottom < clip.Top || r.Top > clip.Bottom) continue;
+                if (r.Bottom < clip.Top || r.Top - b.Bleed > clip.Bottom) continue;
                 b.Paint(g, r, this);
             }
             Block pin = Pinned();
@@ -620,9 +683,24 @@ namespace Spotipaq
         readonly List<PageButton> _buttons;
         int _hotButton = -1; bool _hotBy;
         const int Art = 160, Pad = 30, PadY = 8, TextX = Pad + Art + 24;
-        const int MetaX = TextX + 3;                    // lines up with the padded text above it
         const int DotGap = 6, DotSize = 4;              // the dot between the parts of the bottom line
         static readonly Color Bright = Color.White;
+
+        /// <summary>Set for playlists that come with a wide banner picture (radios, mixes, "This Is", editorial):
+        /// the header is then the banner across the page, running up behind the top bar, with the texts over its
+        /// lower left and the buttons in a row underneath - no square cover.</summary>
+        public string BannerUrl;
+        /// <summary>Plain text before the creator's name on the bottom line ("Made for ").</summary>
+        public string ByPrefix;
+        bool Banner { get { return !String.IsNullOrEmpty(BannerUrl); } }
+        const int BannerH = 250;                                    // from the very top of the page
+        const int BannerBottom = BannerH - PageView.HeaderH;        // in block coordinates (the block starts under the top bar)
+        static readonly Color OnPhoto = Color.FromArgb(228, 228, 228), OnPhotoDim = Color.FromArgb(205, 205, 205);
+        public override int Bleed { get { return Banner ? PageView.HeaderH : 0; } }
+        public override int WashTop { get { return Banner ? BannerBottom : Art + PadY + 10; } }      // the banner's bottom edge / the header's
+        /// <summary>The page colour, when Spotify supplied one for this cover.</summary>
+        public Color Key;
+        public override Color KeyColor { get { return Key; } }
 
         /// <summary>label (small caps), title, an optional description under it, then one line: byName (a link when
         /// byTarget is set) and the "bright" parts in white with dots between them, followed by "dim" in grey.</summary>
@@ -633,12 +711,17 @@ namespace Spotipaq
             _bright = bright ?? new string[0]; _dim = dim; _imageUrl = imageUrl; _buttons = buttons;
         }
 
-        public override int Layout(int width) { return Art + PadY + 10; }
+        public override int Layout(int width) { return Banner ? BannerBottom + 10 + PageButton.RowHeight(_buttons) + 10 : Art + PadY + 10; }
         public override string KeyImageUrl { get { return _imageUrl; } }
-        public override int HeaderContentBottom { get { return PadY + Art; } }       // the cover's and the buttons' bottom edge
+        public override int HeaderContentBottom { get { return Banner ? BannerBottom : PadY + Art; } }       // the cover's and the buttons' bottom edge / the banner's
 
         bool HasDescription { get { return !String.IsNullOrEmpty(_description); } }
-        int MetaY { get { return PadY + (HasDescription ? 86 : 66); } }
+        // where the texts go (block coordinates): beside the cover, or over the bottom left of the banner
+        int TextLeft { get { return Banner ? Pad : TextX; } }
+        int MetaLeft { get { return TextLeft + 3; } }               // lines up with the padded text above it
+        int MetaY { get { return Banner ? BannerBottom - 30 : PadY + (HasDescription ? 86 : 66); } }
+        int DescY { get { return Banner ? BannerBottom - 52 : PadY + 64; } }
+        int TitleY { get { return Banner ? BannerBottom - (HasDescription ? 96 : 74) : PadY + 20; } }
 
         // Exact text widths, so the differently coloured parts of the bottom line sit flush against each other.
         // Measuring the text twice over and once, and taking the difference, leaves only what the text itself
@@ -663,32 +746,55 @@ namespace Spotipaq
 
         Rectangle ButtonRect(int i)
         {
-            int x = TextX;
+            int x = TextLeft;
             for (int j = 0; j < i; j++) x += _buttons[j].Width + 12;
-            int rowH = PageButton.RowHeight(_buttons), h = _buttons[i].Height;      // bottom of the row lines up with the cover's
-            return new Rectangle(x, PadY + Art - rowH + (rowH - h) / 2, _buttons[i].Width, h);
+            int rowH = PageButton.RowHeight(_buttons), h = _buttons[i].Height;
+            if (Banner) return new Rectangle(x, BannerBottom + 10 + (rowH - h) / 2, _buttons[i].Width, h);      // a row under the banner
+            return new Rectangle(x, PadY + Art - rowH + (rowH - h) / 2, _buttons[i].Width, h);                 // bottom of the row lines up with the cover's
         }
         Rectangle ByRect()
         {
-            return new Rectangle(MetaX, MetaY, TextW(_byName, Theme.NormalBold), 20);
+            return new Rectangle(MetaLeft + TextW(ByPrefix, Theme.Normal), MetaY, TextW(_byName, Theme.NormalBold), 20);
+        }
+
+        // The banner: scaled to fill the page's width (centre-cropped by the image cache), from the very top of the
+        // page, darkened towards the bottom so the texts stay readable.
+        void PaintBanner(Graphics g, Rectangle r, PageView view)
+        {
+            // width rounded up to 64px steps, so resizing the window doesn't rescale the banner every pixel
+            int bw = Math.Max(64, (view.ClientSize.Width + 63) / 64 * 64), top = r.Top - PageView.HeaderH;
+            Bitmap banner = view.Host.Images.Get(BannerUrl, bw, BannerH, true);      // keep the top of the picture, cut the bottom
+            if (banner != null)
+            {
+                InterpolationMode im = g.InterpolationMode;
+                g.InterpolationMode = InterpolationMode.NearestNeighbor;            // already the right size
+                g.DrawImage(banner, r.Left, top, bw, BannerH);
+                g.InterpolationMode = im;
+            }
+            using (LinearGradientBrush fade = new LinearGradientBrush(new Rectangle(r.Left, top, bw, BannerH + 1),
+                Color.FromArgb(banner != null ? 20 : 0, 0, 0, 0), Color.FromArgb(banner != null ? 120 : 60, Theme.Main), LinearGradientMode.Vertical))
+                g.FillRectangle(fade, r.Left, top, bw, BannerH);
         }
 
         public override void Paint(Graphics g, Rectangle r, PageView view)
         {
-            Rectangle art = new Rectangle(r.Left + Pad, r.Top + PadY, Art, Art);
-            Theme.Art(g, view.Host.Images.Get(_imageUrl, Art, Art), art, false);
-            // (the page's key colour comes from this same picture, see KeyImageUrl)
-            int x = r.Left + TextX, w = r.Width - TextX - Pad;
-            Theme.Text1(g, _label, Theme.Label, new Rectangle(x, r.Top + PadY + 2, w, 16), Theme.SubText);
-            Theme.Text1(g, _title, Theme.Huge, new Rectangle(x - 2, r.Top + PadY + 20, w, 40), Theme.Text);
+            bool banner = Banner;
+            if (banner) PaintBanner(g, r, view);
+            else Theme.Art(g, view.Host.Images.Get(_imageUrl, Art, Art), new Rectangle(r.Left + Pad, r.Top + PadY, Art, Art), false);
+            // (the page's key colour comes from the cover picture either way, see KeyImageUrl)
+            int x = r.Left + TextLeft, w = r.Width - TextLeft - Pad;
+            Color soft = OnPhoto;                        // on the picture, or on the key colour
+            Theme.Text1(g, _label, Theme.Label, new Rectangle(x, r.Top + TitleY - 18, w, 16), soft);
+            Theme.Text1(g, _title, Theme.Huge, new Rectangle(x - 2, r.Top + TitleY, w, 40), Theme.Text);
             if (HasDescription)
-                Theme.Text1(g, _description, Theme.Normal, new Rectangle(x, r.Top + PadY + 64, w, 20), Theme.SubText);
+                Theme.Text1(g, _description, Theme.Normal, new Rectangle(x, r.Top + DescY, w, 20), soft);
 
-            // creator • 12 songs, 48 min
-            int y = r.Top + MetaY, cx = r.Left + MetaX, right = x + w;
+            // [Made for] creator • 12 songs, 48 min
+            int y = r.Top + MetaY, cx = r.Left + MetaLeft, right = x + w;
             bool first = true;
             if (!String.IsNullOrEmpty(_byName))
             {
+                cx = Part(g, ByPrefix, Theme.Normal, cx, y, right, soft);
                 int end = Part(g, _byName, Theme.NormalBold, cx, y, right, Bright);
                 if (_hotBy) using (Pen u = new Pen(Bright)) g.DrawLine(u, cx, y + 17, Math.Min(end, right) - 1, y + 17);
                 cx = end; first = false;
@@ -706,7 +812,7 @@ namespace Spotipaq
                 cx = Part(g, part, Theme.Normal, cx, y, right, Bright);
                 first = false;
             }
-            Part(g, _dim, Theme.Normal, cx, y, right, Theme.SubText);
+            Part(g, _dim, Theme.Normal, cx, y, right, OnPhotoDim);
 
             for (int i = 0; i < _buttons.Count; i++)
             {
@@ -927,11 +1033,10 @@ namespace Spotipaq
         // ---- column headers: in the list, and again pinned under the page's top bar once they have scrolled up to it
         public override int PinTop { get { return Tools; } }
         public override int PinHeight { get { return _header ? HeadH : 0; } }
-        static readonly Color PinnedBack = Color.FromArgb(24, 24, 24);
 
         public override void PaintPinned(Graphics g, Rectangle r, PageView view)
         {
-            using (SolidBrush b = new SolidBrush(PinnedBack)) g.FillRectangle(b, 0, r.Top, view.ClientSize.Width, r.Height);
+            view.FillWash(g, new Rectangle(0, r.Top, view.ClientSize.Width, r.Height));      // the page's own background: no visible bar
             PaintHead(g, r.Left, r.Top, r.Width);
         }
 

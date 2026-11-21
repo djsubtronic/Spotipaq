@@ -295,6 +295,10 @@ namespace Spotipaq.Engine
             return a;
         }
 
+        // playlist id -> cover colour, from every listing seen (library, search, home): the request that loads a
+        // playlist's page doesn't carry it
+        static readonly Dictionary<string, string> _coverColors = new Dictionary<string, string>();
+
         static Playlist JsonPlaylist(JToken d)
         {
             Playlist p = new Playlist();
@@ -303,6 +307,9 @@ namespace Spotipaq.Engine
             p.Description = TextUtil.Clean(J(d, "description"));
             p.Owner = J(d, "ownerV2.data.name") ?? J(d, "owner.name");
             p.ImageUrl = Src(d.SelectToken("images.items[0].sources"), 300);
+            // the colour Spotify extracted from the cover: what its own client paints the page with
+            p.Color = J(d, "images.items[0].extractedColors.colorDark.hex");
+            if (!String.IsNullOrEmpty(p.Color) && !String.IsNullOrEmpty(p.Id)) lock (_coverColors) _coverColors[p.Id] = p.Color;
             return p;
         }
 
@@ -425,6 +432,16 @@ namespace Spotipaq.Engine
             }
             p.Tracks = FetchTracks(ids);
             string cover = attrs != null ? PlaylistCover(attrs) : null;
+            lock (_coverColors) { string col; if (_coverColors.TryGetValue(id, out col)) p.Color = col; }
+            if (attrs != null)
+            {
+                // "format attributes": key / value pairs. Generated and editorial playlists carry a wide banner picture
+                // for the desktop header, and personal ones say who they were made for.
+                Dictionary<string, string> fa = FormatAttributes(attrs);
+                string v;
+                if (fa.TryGetValue("header_image_url_desktop", out v) && v.StartsWith("https://", StringComparison.Ordinal)) p.HeaderImageUrl = v;
+                if (fa.TryGetValue("madeFor.username", out v) && v.Length > 0 && (!fa.ContainsKey("madeFor.displayed") || fa["madeFor.displayed"] == "1")) p.MadeFor = v;
+            }
             if (cover != null && ImageExists(cover)) { p.ImageUrl = cover; Log.Write("Playlist cover: its own picture"); }
             else
             {
@@ -437,9 +454,29 @@ namespace Spotipaq.Engine
         /// <summary>The playlist's own cover: a ready-made image URL in its attributes, or the 20-byte image id in field 3.</summary>
         static string PlaylistCover(Dictionary<int, List<ProtoField>> attrs)
         {
+            // field 13: named picture sizes ("default" -> URL). This is where generated covers (radios, mixes,
+            // "This Is") live; they are served from other hosts than the uploaded ones below.
+            if (attrs.ContainsKey(13))
+            {
+                string def = null, any = null;
+                foreach (ProtoField f in attrs[13])
+                {
+                    try
+                    {
+                        Dictionary<int, List<ProtoField>> m = f.Message.ReadAll();
+                        string k = Str(m, 1), u = Str(m, 2);
+                        if (u == null || !u.StartsWith("https://", StringComparison.Ordinal)) continue;
+                        if (any == null) any = u;
+                        if (k == "default") def = u;
+                    }
+                    catch { }
+                }
+                if ((def ?? any) != null) return def ?? any;
+            }
             foreach (KeyValuePair<int, List<ProtoField>> kv in attrs)
                 foreach (ProtoField f in kv.Value)
                 {
+                    if (kv.Key == 12 || kv.Key == 13) continue;        // format attributes hold other pictures (banner, artist photo), not the cover
                     if (f.Data == null || f.Data.Length < 12 || f.Data.Length > 300) continue;
                     ProtoReader inner = new ProtoReader(f.Data);
                     string direct = f.Text;
@@ -458,6 +495,24 @@ namespace Spotipaq.Engine
             ProtoField? pic = ProtoReader.First(attrs, 3);
             if (pic != null && pic.Value.Data != null && pic.Value.Data.Length == 20) return "https://i.scdn.co/image/" + Spclient.Hex(pic.Value.Data);
             return null;
+        }
+
+        /// <summary>The playlist's format attributes (field 12 of its attributes): key -> value.</summary>
+        static Dictionary<string, string> FormatAttributes(Dictionary<int, List<ProtoField>> attrs)
+        {
+            Dictionary<string, string> d = new Dictionary<string, string>();
+            if (!attrs.ContainsKey(12)) return d;
+            foreach (ProtoField f in attrs[12])
+            {
+                try
+                {
+                    Dictionary<int, List<ProtoField>> m = f.Message.ReadAll();
+                    string k = Str(m, 1), v = Str(m, 2);
+                    if (!String.IsNullOrEmpty(k)) d[k] = v ?? "";
+                }
+                catch { }
+            }
+            return d;
         }
 
         static bool ImageExists(string url)
