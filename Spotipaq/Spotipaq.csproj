@@ -55,6 +55,7 @@
     <Compile Include="LoginForm.cs">
       <SubType>Form</SubType>
     </Compile>
+    <Compile Include="Emoji.cs" />
     <Compile Include="Chrome.cs">
       <SubType>Component</SubType>
     </Compile>
@@ -74,6 +75,51 @@
     <Content Include="resources\spotipaq.ico" />
     <EmbeddedResource Include="resources\spotipaq.ico">
       <LogicalName>spotipaq.ico</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="resources\ic_library.png">
+      <LogicalName>ic_library.png</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="resources\ic_share.png">
+      <LogicalName>ic_share.png</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="resources\emoji.png">
+      <LogicalName>emoji.png</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="resources\emoji_big.png">
+      <LogicalName>emoji_big.png</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="resources\emoji.txt">
+      <LogicalName>emoji.txt</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="resources\ic_clock.png">
+      <LogicalName>ic_clock.png</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="resources\ic_home.png">
+      <LogicalName>ic_home.png</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="resources\ic_shuffle.png">
+      <LogicalName>ic_shuffle.png</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="resources\ic_shuffle_big.png">
+      <LogicalName>ic_shuffle_big.png</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="resources\ic_repeat.png">
+      <LogicalName>ic_repeat.png</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="resources\ic_repeat1.png">
+      <LogicalName>ic_repeat1.png</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="resources\ic_prev.png">
+      <LogicalName>ic_prev.png</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="resources\ic_next.png">
+      <LogicalName>ic_next.png</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="resources\ic_vol.png">
+      <LogicalName>ic_vol.png</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="resources\ic_mute.png">
+      <LogicalName>ic_mute.png</LogicalName>
     </EmbeddedResource>
     <None Include="packages.config" />
   </ItemGroup>

@@ -18,7 +18,7 @@ namespace Spotipaq
         [System.Runtime.InteropServices.DllImport("user32.dll")] static extern IntPtr SendMessage(IntPtr h, int msg, IntPtr w, IntPtr l);
         [System.Runtime.InteropServices.DllImport("user32.dll")] static extern bool DrawIconEx(IntPtr hdc, int x, int y, IntPtr icon, int w, int h, int step, IntPtr brush, int flags);
 
-        public static readonly Color BarColor = Color.FromArgb(18, 18, 18);
+        public static readonly Color BarColor = Theme.Window;
         static readonly Color TitleColor = Color.FromArgb(0xeb, 0xeb, 0xeb);
         static readonly Color CloseHot = Color.FromArgb(0xda, 0x37, 0x3c);
         /// <summary>Right-click on the bar; carries the screen position for the window menu.</summary>
@@ -139,54 +139,54 @@ namespace Spotipaq
     }
 
     // ------------------------------------------------------------------------------------------------
-    // Sidebar
+    // Library card: "Your Library", three pills (Liked Songs / Artists / Albums), then the playlists with
+    // their artwork. The header and pills stay put; the playlists scroll under them. Playlists can be dragged
+    // into a different order.
     // ------------------------------------------------------------------------------------------------
-    public sealed class SidebarItem
-    {
-        public string Text; public NavTarget Target; public bool IsHeader; public char Icon;
-        public bool Library, Collapsible;     // Library: belongs to the collapsible "YOUR LIBRARY" group
-        public SidebarItem(string text, NavTarget target, bool header, char icon) { Text = text; Target = target; IsHeader = header; Icon = icon; }
-    }
-
     public sealed class Sidebar : Control
     {
         public event EventHandler<NavEventArgs> ItemClicked;
         /// <summary>Raised after the user drags a playlist to a new place; carries the playlist ids in their new order.</summary>
         public event EventHandler<OrderEventArgs> PlaylistsReordered;
-        public event EventHandler LibraryToggled;
-        public bool LibraryCollapsed;
-        /// <summary>Right-click on an item.</summary>
+        /// <summary>Right-click on a playlist.</summary>
         public event EventHandler<NavEventArgs> ItemContext;
-        readonly List<SidebarItem> _items = new List<SidebarItem>();
-        int _press = -1, _drop = -1;
+        public ImageCache Images;
+
+        readonly List<Playlist> _lists = new List<Playlist>();
+        NavTarget _current;
+        int _scroll, _hot = -1, _press = -1, _drop = -1;
         Point _downPt;
         bool _dragging;
         readonly System.Windows.Forms.Timer _autoScroll = new System.Windows.Forms.Timer();
-        NavTarget _current;
-        int _hot = -1, _scroll;
-        const int ItemH = 30, HeadH = 34;
 
-        // custom scrollbar: same look and behaviour as the main page's, darkened by the sidebar/main background ratio (18/24 = 0.75)
-        const int BarW = 8;
-        bool _dragThumb;
-        int _dragOffset;
-        static readonly Color BarTrack = Color.FromArgb(23, 23, 23);        // main: 30
-        static readonly Color BarThumb = Color.FromArgb(68, 68, 68);        // main: 90
-        static readonly Color BarThumbDrag = Color.FromArgb(113, 113, 113); // main: 150
-        int MaxScroll { get { return Math.Max(0, ContentHeight - Height); } }
+        // rows are sized like the track list's: 36 px, a 28 px cover, the same gaps
+        const int RowH = 36, ArtSize = 28, HeaderH = 42, PillH = 26, TopH = 82;      // TopH: where the playlists start
+        static readonly string[] PillText = { "Liked Songs", "Artists", "Albums" };
+        static readonly PageKind[] PillKind = { PageKind.Songs, PageKind.Artists, PageKind.Albums };
+        static readonly Color PillBack = Color.FromArgb(39, 39, 39), PillHot = Color.FromArgb(45, 45, 45), PillDown = Color.FromArgb(32, 32, 32);
+        static readonly Color HeaderText = Color.FromArgb(179, 179, 179);
+        static int[] _pillTextW;
+        int _hotPill = -1, _downPill = -1;
+
+        // scrollbar: same look and behaviour as the main page's, darkened by the sidebar/main background ratio
+        const int BarW = SlimScroll.W;
+        readonly SlimScroll _bar;
+        static readonly Color BarTrack = Color.FromArgb(23, 23, 23);
+        static readonly Color BarThumb = Color.FromArgb(68, 68, 68);
+        static readonly Color BarThumbDrag = Color.FromArgb(113, 113, 113);
+        int ListH { get { return Math.Max(0, Height - TopH); } }
+        int ContentHeight { get { return _lists.Count * RowH + 8; } }
+        int MaxScroll { get { return Math.Max(0, ContentHeight - ListH); } }
         void ClampScroll() { _scroll = Math.Max(0, Math.Min(_scroll, MaxScroll)); }
-        int ViewW { get { return Width - BarW; } }          // width available to the items (the bar's strip is always reserved, like the main page)
-
-        Rectangle Thumb()
-        {
-            int h = Height;
-            int th = Math.Max(30, (int)((long)h * h / Math.Max(1, ContentHeight)));
-            int ty = MaxScroll == 0 ? 0 : (int)((long)(h - th) * _scroll / MaxScroll);
-            return new Rectangle(Width - BarW + 1, ty, BarW - 2, th);
-        }
+        int ViewW { get { return Width - BarW; } }          // width available to the rows (the bar's strip is always reserved)
 
         public Sidebar()
         {
+            _bar = new SlimScroll(this, delegate { return _scroll; }, delegate { return MaxScroll; },
+                delegate (int v) { _scroll = v; ClampScroll(); }, RowH * 2, BarTrack, BarThumb, BarThumbDrag);
+            _bar.TopInset = TopH;                           // the bar belongs to the playlists, not the header
+            _bar.ViewInset = TopH;
+            _bar.BottomInset = Theme.CardRadius;
             SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
             BackColor = Theme.Sidebar;
             _autoScroll.Interval = 40;
@@ -194,149 +194,126 @@ namespace Spotipaq
             {
                 if (!_dragging) { _autoScroll.Stop(); return; }
                 Point p = PointToClient(Cursor.Position);
-                int step = p.Y < 24 ? -14 : p.Y > Height - 24 ? 14 : 0;
+                int step = p.Y < TopH + 24 ? -14 : p.Y > Height - 24 ? 14 : 0;
                 if (step == 0) return;
-                _scroll = Math.Max(0, Math.Min(_scroll + step, Math.Max(0, ContentHeight - Height)));
+                _scroll += step; ClampScroll();
                 _drop = DropSlot(p.Y);
                 Invalidate();
             };
         }
 
-        bool IsPlaylistItem(int i) { return i >= 0 && i < _items.Count && !_items[i].IsHeader && _items[i].Target != null && _items[i].Target.Kind == PageKind.Playlist; }
-
-        int FirstPlaylist() { for (int i = 0; i < _items.Count; i++) if (IsPlaylistItem(i)) return i; return _items.Count; }
-
-        /// <summary>Insertion slot (a position in _items, between playlists) closest to y.</summary>
-        int DropSlot(int y)
-        {
-            int first = FirstPlaylist();
-            for (int k = first; k < _items.Count; k++)
-                if (y < ItemTop(k) + ItemH / 2) return k;
-            return _items.Count;
-        }
-
         public void SetPlaylists(List<Playlist> playlists)
         {
-            _items.Clear();
-            _items.Add(new SidebarItem("Browse", new NavTarget(PageKind.Browse, null), false, 'B'));
-            SidebarItem lib = new SidebarItem("YOUR LIBRARY", null, true, ' '); lib.Collapsible = true;
-            _items.Add(lib);
-            SidebarItem it1 = new SidebarItem("Liked Songs", new NavTarget(PageKind.Songs, null), false, 'S'); it1.Library = true; _items.Add(it1);
-            SidebarItem it2 = new SidebarItem("Saved Albums", new NavTarget(PageKind.Albums, null), false, 'A'); it2.Library = true; _items.Add(it2);
-            SidebarItem it3 = new SidebarItem("Saved Artists", new NavTarget(PageKind.Artists, null), false, 'R'); it3.Library = true; _items.Add(it3);
-            _items.Add(new SidebarItem("PLAYLISTS", null, true, ' '));
-            if (playlists != null)
-                foreach (Playlist p in playlists)
-                    _items.Add(new SidebarItem(p.Name + (p.Owner == "Spotify" ? "  by Spotify" : ""), new NavTarget(PageKind.Playlist, p.Id), false, 'P'));
+            _lists.Clear();
+            if (playlists != null) _lists.AddRange(playlists);
+            _hot = -1;
             ClampScroll();
             Invalidate();
         }
 
-        protected override void OnResize(EventArgs e) { base.OnResize(e); ClampScroll(); }
-
         public void SetCurrent(NavTarget t) { _current = t; Invalidate(); }
 
-        bool Hidden(int i) { return LibraryCollapsed && _items[i].Library; }
-        int ItemTop(int i) { int y = 8 - _scroll; for (int j = 0; j < i; j++) { if (Hidden(j)) continue; y += _items[j].IsHeader ? HeadH : ItemH; } return y; }
-        int ContentHeight { get { return ItemTop(_items.Count) + _scroll + 8; } }
+        protected override void OnResize(EventArgs e) { base.OnResize(e); ClampScroll(); }
+
+        int RowTop(int i) { return TopH + i * RowH - _scroll; }
+        int RowAt(int y)
+        {
+            if (y < TopH) return -1;
+            int i = (y - TopH + _scroll) / RowH;
+            return i >= 0 && i < _lists.Count ? i : -1;
+        }
+        /// <summary>Insertion slot (a position between playlists) closest to y.</summary>
+        int DropSlot(int y)
+        {
+            for (int k = 0; k < _lists.Count; k++)
+                if (y < RowTop(k) + RowH / 2) return k;
+            return _lists.Count;
+        }
+
+        // ---- pills
+        Rectangle PillRect(int i)
+        {
+            if (_pillTextW == null)
+            {
+                int[] w = new int[PillText.Length];
+                for (int k = 0; k < w.Length; k++) w[k] = Theme.Measure(PillText[k], Theme.SmallBold).Width;
+                _pillTextW = w;
+            }
+            const int gap = 6, left = 12;
+            int pad = 8, avail = ViewW - left - 4, total;
+            do                                               // squeeze the padding if the card is narrow
+            {
+                total = gap * (PillText.Length - 1);
+                for (int k = 0; k < PillText.Length; k++) total += _pillTextW[k] + 2 * pad;
+            } while (total > avail && --pad > 1);
+            int x = left;
+            for (int k = 0; k < i; k++) x += _pillTextW[k] + 2 * pad + gap;
+            return new Rectangle(x, HeaderH, _pillTextW[i] + 2 * pad, PillH);
+        }
+        int PillAt(Point p) { for (int i = 0; i < PillText.Length; i++) if (PillRect(i).Contains(p)) return i; return -1; }
+
+        static string RowText(Playlist p) { return p.Name + (p.Owner == "Spotify" ? "  by Spotify" : ""); }
 
         protected override void OnPaint(PaintEventArgs e)
         {
             Graphics g = e.Graphics;
             g.Clear(Theme.Sidebar);
-            for (int i = 0; i < _items.Count; i++)
+
+            // playlists
+            for (int i = 0; i < _lists.Count; i++)
             {
-                SidebarItem it = _items[i];
-                if (Hidden(i)) continue;
-                int y = ItemTop(i), h = it.IsHeader ? HeadH : ItemH;
-                if (y + h < 0 || y > Height) continue;
-                if (it.IsHeader)
-                {
-                    bool hotHead = it.Collapsible && i == _hotHeader;
-                    Theme.Text1(g, it.Text, Theme.Label, new Rectangle(16, y + 14, ViewW - 24, 18), hotHead ? Theme.SubText : Theme.DimText);
-                    if (it.Collapsible)
-                    {
-                        int cx = ViewW - 22, cy = y + 23;
-                        using (SolidBrush cb = new SolidBrush(hotHead ? Theme.SubText : Theme.DimText))
-                            g.FillPolygon(cb, LibraryCollapsed ? new Point[] { new Point(cx, cy - 4), new Point(cx + 4, cy), new Point(cx, cy + 4) }
-                                                               : new Point[] { new Point(cx - 3, cy - 2), new Point(cx + 5, cy - 2), new Point(cx + 1, cy + 3) });
-                    }
-                    continue;
-                }
-                if (_dragging && i == _press) using (SolidBrush b = new SolidBrush(Theme.RowHover)) g.FillRectangle(b, 0, y, ViewW, h);
-                bool current = _current != null && it.Target.Kind == _current.Kind && it.Target.Id == _current.Id;
-                if (current) using (SolidBrush b = new SolidBrush(Theme.Accent)) g.FillRectangle(b, 0, y + 4, 4, h - 8);
-                Color c = current || i == _hot ? Theme.Text : Theme.SubText;
-                DrawIcon(g, it.Icon, new Rectangle(16, y + 7, 16, 16), c);
-                Theme.Text1(g, it.Text, Theme.Normal, new Rectangle(40, y, ViewW - 48, h), c);
+                int y = RowTop(i);
+                if (y + RowH < TopH || y > Height) continue;
+                Playlist p = _lists[i];
+                bool hot = _dragging ? i == _press : i == _hot;
+                if (hot) using (SolidBrush b = new SolidBrush(Theme.RowHover)) g.FillRectangle(b, 6, y, ViewW - 8, RowH);
+                Theme.Art(g, Images == null ? null : Images.Get(p.ImageUrl, ArtSize, ArtSize), new Rectangle(14, y + (RowH - ArtSize) / 2, ArtSize, ArtSize), false);
+                bool current = _current != null && _current.Kind == PageKind.Playlist && _current.Id == p.Id;
+                Theme.Text1(g, RowText(p), Theme.Normal, new Rectangle(14 + ArtSize + 10, y, ViewW - (14 + ArtSize + 10) - 8, RowH), current ? Theme.Accent : Theme.Text);
             }
             if (_dragging && _drop >= 0)
             {
-                int ly = ItemTop(_drop);
-                using (SolidBrush b = new SolidBrush(Theme.Accent)) g.FillRectangle(b, 8, ly - 1, ViewW - 20, 2);
+                int ly = RowTop(_drop);
+                if (ly >= TopH) using (SolidBrush b = new SolidBrush(Theme.Accent)) g.FillRectangle(b, 8, ly - 1, ViewW - 20, 2);
             }
-            if (MaxScroll > 0)
-            {
-                using (SolidBrush track = new SolidBrush(BarTrack)) g.FillRectangle(track, Width - BarW, 0, BarW, Height);
-                using (SolidBrush tb = new SolidBrush(_dragThumb ? BarThumbDrag : BarThumb)) g.FillRectangle(tb, Thumb());
-            }
-            using (Pen p = new Pen(Color.FromArgb(44, 44, 44))) g.DrawLine(p, Width - 1, 0, Width - 1, Height);
-        }
+            _bar.Paint(g);
 
-        // Tiny vector icons so nothing depends on fonts/images that XP may not have.
-        static void DrawIcon(Graphics g, char kind, Rectangle r, Color c)
-        {
-            using (Pen p = new Pen(c, 1.4f))
-            using (SolidBrush b = new SolidBrush(c))
+            // fixed top: covers whatever scrolled up under it
+            using (SolidBrush b = new SolidBrush(Theme.Sidebar)) g.FillRectangle(b, 0, 0, Width, TopH);
+            bool libIcon = Glyphs.Draw(g, "ic_library", new Rectangle(14, 6, 22, HeaderH - 8), HeaderText);      // same place as Home's
+            Theme.Text1(g, "Your Library", Theme.NormalBold, new Rectangle(libIcon ? 44 : 14, 6, ViewW - 50, HeaderH - 8), HeaderText);
+            for (int i = 0; i < PillText.Length; i++)
             {
+                Rectangle r = PillRect(i);
+                bool on = _current != null && _current.Kind == PillKind[i];
+                Color back = on ? Color.White : i == _downPill ? PillDown : i == _hotPill ? PillHot : PillBack;
                 g.SmoothingMode = SmoothingMode.AntiAlias;
-                switch (kind)
-                {
-                    case 'B': g.DrawEllipse(p, r.Left + 1, r.Top + 1, 13, 13); g.FillEllipse(b, r.Left + 6, r.Top + 6, 3, 3); break;     // compass-ish
-                    case 'S': g.DrawEllipse(p, r.Left + 1, r.Top + 9, 6, 5); g.DrawLine(p, r.Left + 7, r.Top + 11, r.Left + 7, r.Top + 1); g.DrawLine(p, r.Left + 7, r.Top + 1, r.Left + 13, r.Top + 3); break;
-                    case 'A': g.DrawEllipse(p, r.Left + 1, r.Top + 1, 13, 13); g.DrawEllipse(p, r.Left + 6, r.Top + 6, 3, 3); break;
-                    case 'R': g.DrawEllipse(p, r.Left + 4, r.Top + 1, 7, 7); g.DrawArc(p, r.Left + 1, r.Top + 9, 13, 10, 180, 180); break;
-                    default: for (int i = 0; i < 3; i++) g.DrawLine(p, r.Left + 1, r.Top + 3 + i * 5, r.Left + 14, r.Top + 3 + i * 5); break;
-                }
+                using (GraphicsPath path = Theme.Pill(r))
+                using (SolidBrush b = new SolidBrush(back)) g.FillPath(b, path);
                 g.SmoothingMode = SmoothingMode.None;
+                Theme.Draw(g, PillText[i], Theme.SmallBold, r, on ? Color.Black : Theme.Text,
+                    TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine);
             }
+            Theme.CardCorners(g, ClientRectangle, Theme.CardRadius, Theme.Window);      // the library is a rounded card
         }
-
-        int ItemAt(int y) { for (int i = 0; i < _items.Count; i++) { if (Hidden(i)) continue; int t = ItemTop(i), h = _items[i].IsHeader ? HeadH : ItemH; if (y >= t && y < t + h) return _items[i].IsHeader ? -1 : i; } return -1; }
-
-        int _hotHeader = -1;
-        int CollapsibleHeaderAt(int y) { for (int i = 0; i < _items.Count; i++) { if (!_items[i].IsHeader || !_items[i].Collapsible) continue; int t = ItemTop(i); if (y >= t && y < t + HeadH) return i; } return -1; }
 
         protected override void OnMouseDown(MouseEventArgs e)
         {
             base.OnMouseDown(e);
             if (e.Button != MouseButtons.Left) return;
-            if (MaxScroll > 0 && e.X >= Width - BarW)
-            {
-                Rectangle t = Thumb();
-                if (t.Contains(e.Location)) { _dragThumb = true; _dragOffset = e.Y - t.Top; Capture = true; }
-                else { _scroll += e.Y < t.Top ? -Height : Height; ClampScroll(); Invalidate(); }
-                return;
-            }
-            int i = ItemAt(e.Y);
-            _press = IsPlaylistItem(i) ? i : -1;
+            if (_bar.MouseDown(e)) return;
+            _downPill = PillAt(e.Location);
+            _press = _downPill < 0 ? RowAt(e.Y) : -1;
             _downPt = e.Location;
             _dragging = false;
+            if (_downPill >= 0) Invalidate();
         }
 
         protected override void OnMouseMove(MouseEventArgs e)
         {
-            if (_dragThumb)
+            if (_bar.MouseMove(e) && _press < 0)
             {
-                int viewH = Height, th = Thumb().Height;
-                _scroll = (int)((long)(e.Y - _dragOffset) * MaxScroll / Math.Max(1, viewH - th));
-                ClampScroll();
-                Invalidate();
-                return;
-            }
-            if (MaxScroll > 0 && e.X >= Width - BarW && _press < 0)
-            {
-                if (_hot != -1 || _hotHeader != -1) { _hot = -1; _hotHeader = -1; Invalidate(); }
+                if (_hot != -1 || _hotPill != -1) { _hot = -1; _hotPill = -1; Invalidate(); }
                 Cursor = Cursors.Default;
                 base.OnMouseMove(e);
                 return;
@@ -353,23 +330,31 @@ namespace Spotipaq
                     return;
                 }
             }
-            int h = ItemAt(e.Y), hh = CollapsibleHeaderAt(e.Y);
-            if (h != _hot || hh != _hotHeader) { _hot = h; _hotHeader = hh; Invalidate(); }
-            Cursor = h >= 0 || hh >= 0 ? Cursors.Hand : Cursors.Default; base.OnMouseMove(e);
+            int pill = PillAt(e.Location), row = pill < 0 ? RowAt(e.Y) : -1;
+            if (row != _hot || pill != _hotPill) { _hot = row; _hotPill = pill; Invalidate(); }
+            Cursor = row >= 0 || pill >= 0 ? Cursors.Hand : Cursors.Default;
+            base.OnMouseMove(e);
         }
 
-        protected override void OnMouseLeave(EventArgs e) { _hot = -1; _hotHeader = -1; Invalidate(); base.OnMouseLeave(e); }
+        protected override void OnMouseLeave(EventArgs e)
+        {
+            _hot = -1; _hotPill = -1; _downPill = -1;
+            _bar.MouseLeave();
+            Invalidate();
+            base.OnMouseLeave(e);
+        }
 
         protected override void OnMouseUp(MouseEventArgs e)
         {
-            if (_dragThumb) { _dragThumb = false; Capture = false; Invalidate(); base.OnMouseUp(e); return; }
+            if (_bar.MouseUp(e)) { base.OnMouseUp(e); return; }
             bool wasDrag = _dragging;
-            int press = _press, slot = _drop;
-            _press = -1; _drop = -1; _dragging = false; Capture = false; _autoScroll.Stop();
+            int press = _press, slot = _drop, downPill = _downPill;
+            _press = -1; _drop = -1; _downPill = -1; _dragging = false; Capture = false; _autoScroll.Stop();
+            Invalidate();
             if (e.Button == MouseButtons.Right)
             {
-                int ri = ItemAt(e.Y);
-                if (ri >= 0 && ItemContext != null) ItemContext(this, new NavEventArgs(_items[ri].Target));
+                int ri = RowAt(e.Y);
+                if (ri >= 0 && PillAt(e.Location) < 0 && ItemContext != null) ItemContext(this, new NavEventArgs(new NavTarget(PageKind.Playlist, _lists[ri].Id)));
                 base.OnMouseUp(e);
                 return;
             }
@@ -378,35 +363,31 @@ namespace Spotipaq
             {
                 if (press >= 0 && slot >= 0 && slot != press && slot != press + 1)
                 {
-                    SidebarItem moved = _items[press];
-                    _items.RemoveAt(press);
-                    _items.Insert(slot > press ? slot - 1 : slot, moved);
+                    Playlist moved = _lists[press];
+                    _lists.RemoveAt(press);
+                    _lists.Insert(slot > press ? slot - 1 : slot, moved);
                     List<string> ids = new List<string>();
-                    for (int k = 0; k < _items.Count; k++) if (IsPlaylistItem(k)) ids.Add(_items[k].Target.Id);
+                    foreach (Playlist p in _lists) ids.Add(p.Id);
                     if (PlaylistsReordered != null) PlaylistsReordered(this, new OrderEventArgs(ids));
                 }
-                Invalidate();
                 base.OnMouseUp(e);
                 return;
             }
-            if (press < 0 && CollapsibleHeaderAt(e.Y) >= 0)
+            if (downPill >= 0)
             {
-                LibraryCollapsed = !LibraryCollapsed;
-                _scroll = Math.Max(0, Math.Min(_scroll, Math.Max(0, ContentHeight - Height)));
-                Invalidate();
-                if (LibraryToggled != null) LibraryToggled(this, EventArgs.Empty);
+                if (PillAt(e.Location) == downPill && ItemClicked != null) ItemClicked(this, new NavEventArgs(new NavTarget(PillKind[downPill], null)));
                 base.OnMouseUp(e);
                 return;
             }
-            int i = ItemAt(e.Y);
-            if (i >= 0 && i == press && ItemClicked != null) ItemClicked(this, new NavEventArgs(_items[i].Target));
-            else if (i >= 0 && press < 0 && ItemClicked != null) ItemClicked(this, new NavEventArgs(_items[i].Target));
+            int i = RowAt(e.Y);
+            if (i >= 0 && i == press && ItemClicked != null) ItemClicked(this, new NavEventArgs(new NavTarget(PageKind.Playlist, _lists[i].Id)));
             base.OnMouseUp(e);
         }
 
         protected override void OnMouseWheel(MouseEventArgs e)
         {
-            _scroll = Math.Max(0, Math.Min(_scroll - e.Delta / 120 * 60, Math.Max(0, ContentHeight - Height)));
+            _scroll -= e.Delta / 120 * RowH * 2;
+            ClampScroll();
             Invalidate();
             base.OnMouseWheel(e);
         }
@@ -425,19 +406,20 @@ namespace Spotipaq
     }
 
     // ------------------------------------------------------------------------------------------------
-    // Top bar: < >  [ search ]                                   user v
+    // Home / search card: the small rounded card above the library - a Home row, and the search box under it.
+    // (Back / forward and the profile button live in the page's own header, see PageView.)
     // ------------------------------------------------------------------------------------------------
     public sealed class TopBar : Control
     {
-        public event EventHandler Back, Forward;
         public event EventHandler<SearchEventArgs> SearchRequested;
+        public event EventHandler HomeClicked;
         public readonly TextBox SearchBox = new TextBox();
-        public bool CanBack, CanForward;
-        public ContextMenuStrip UserMenu;   // shown when the name / arrow at the top right is clicked
-        string _user = "";
-        int _hot;   // 1 back, 2 forward
         Rectangle _searchFrame;
-        // search box: dark like the bar, outlined; outline, lens and text brighten on hover / focus
+        // Home row (the page that used to be "Browse" in the library list): white while that page is open or hovered
+        bool _homeActive, _homeHot;
+        public bool HomeActive { get { return _homeActive; } set { if (value != _homeActive) { _homeActive = value; Invalidate(); } } }
+        Rectangle HomeRect { get { return new Rectangle(0, 6, Width, 36); } }
+        // search box: dark like the card, outlined; outline, lens and text brighten on hover / focus
         static readonly Color SearchIdle = Color.FromArgb(80, 80, 80), SearchActive = Color.FromArgb(170, 170, 170);      // the seek bar's rail grey / its played part
         /// <summary>The search box's outline, in this control's coordinates.</summary>
         public Rectangle SearchFrame { get { return _searchFrame; } }
@@ -452,10 +434,10 @@ namespace Spotipaq
         public TopBar()
         {
             SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
-            BackColor = Theme.Bar;
-            Height = 50;
+            BackColor = Theme.Sidebar;
+            Height = 88;
             SearchBox.BorderStyle = BorderStyle.None;
-            SearchBox.BackColor = Theme.Bar;
+            SearchBox.BackColor = Theme.Sidebar;
             SearchBox.ForeColor = SearchActive;                 // text: light grey unfocused, white while typing
             SearchBox.Font = Theme.Normal;
             SearchBox.GotFocus += delegate { SearchBox.ForeColor = Color.White; Invalidate(); };
@@ -463,6 +445,7 @@ namespace Spotipaq
             SearchBox.MouseEnter += delegate { UpdateSearchHot(); };
             SearchBox.MouseLeave += delegate { UpdateSearchHot(); };
             Menus.ForTextBox(SearchBox);
+            SearchBox.TextChanged += delegate { Invalidate(); };       // the X comes and goes with the text
             SearchBox.KeyDown += delegate (object s, KeyEventArgs e)
             {
                 if (e.KeyCode == Keys.Enter && SearchBox.Text.Trim().Length > 0 && SearchRequested != null)
@@ -474,23 +457,25 @@ namespace Spotipaq
             Controls.Add(SearchBox);
         }
 
-        public void SetUser(string name) { _user = name ?? ""; Invalidate(); }
-
         protected override void OnLayout(LayoutEventArgs e)
         {
-            _searchFrame = new Rectangle(80, 12, Math.Min(299, Width - 260), 26);
+            _searchFrame = new Rectangle(12, 48, Math.Max(60, Width - 24), 26);
             int h = SearchBox.PreferredHeight;
-            SearchBox.SetBounds(_searchFrame.Left + 26, _searchFrame.Top + (_searchFrame.Height - h) / 2, _searchFrame.Width - 36, h);
+            SearchBox.SetBounds(_searchFrame.Left + 26, _searchFrame.Top + (_searchFrame.Height - h) / 2, _searchFrame.Width - 26 - 28, h);     // room for the X
             base.OnLayout(e);
         }
 
         protected override void OnPaint(PaintEventArgs e)
         {
             Graphics g = e.Graphics;
-            g.Clear(Theme.Bar);
+            g.Clear(Theme.Sidebar);
+            Rectangle hr = HomeRect;
+            Color hc = _homeActive || _homeHot ? Theme.Text : Theme.SubText;
+            if (!Glyphs.Draw(g, "ic_home", new Rectangle(14, hr.Top, 22, hr.Height), hc))
+                using (SolidBrush hb = new SolidBrush(hc))       // fallback: a plain house shape
+                    g.FillPolygon(hb, new Point[] { new Point(25, hr.Top + 9), new Point(33, hr.Top + 17), new Point(33, hr.Top + 27), new Point(17, hr.Top + 27), new Point(17, hr.Top + 17) });
+            Theme.Text1(g, "Home", Theme.NormalBold, new Rectangle(44, hr.Top, Width - 56, hr.Height), hc);
             g.SmoothingMode = SmoothingMode.AntiAlias;
-            Chevron(g, 22, 25, true, CanBack, _hot == 1);
-            Chevron(g, 52, 25, false, CanForward, _hot == 2);
             Color sc = SearchLit ? SearchActive : SearchIdle;
             using (GraphicsPath p = Theme.Pill(new Rectangle(_searchFrame.X, _searchFrame.Y, _searchFrame.Width - 1, _searchFrame.Height - 1)))
             using (Pen edge = new Pen(sc, 1f)) g.DrawPath(edge, p);
@@ -499,45 +484,41 @@ namespace Spotipaq
                 g.DrawEllipse(lens, _searchFrame.Left + 9, _searchFrame.Top + 7, 9, 9);
                 g.DrawLine(lens, _searchFrame.Left + 17, _searchFrame.Top + 15, _searchFrame.Left + 21, _searchFrame.Top + 19);
             }
+            if (SearchBox.TextLength > 0)                              // X: clears the box
+                using (Pen x = new Pen(SearchActive, 1.6f))
+                {
+                    Rectangle xr = ClearRect;
+                    int cx = xr.Left + xr.Width / 2, cy = xr.Top + xr.Height / 2;
+                    g.DrawLine(x, cx - 4, cy - 4, cx + 4, cy + 4);
+                    g.DrawLine(x, cx - 4, cy + 4, cx + 4, cy - 4);
+                }
             g.SmoothingMode = SmoothingMode.None;
-            Rectangle user = new Rectangle(Width - 190, 0, 150, Height);
-            Theme.Draw(g, _user, Theme.Normal, user, _hot == 3 ? Color.White : Theme.Text, TextFormatFlags.Right | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
-            using (Pen p = new Pen(Theme.SubText, 1.5f)) { g.DrawLine(p, Width - 30, 22, Width - 25, 27); g.DrawLine(p, Width - 25, 27, Width - 20, 22); }
+            Theme.CardCorners(g, ClientRectangle, Theme.CardRadius, Theme.Window);
         }
 
-        static void Chevron(Graphics g, int cx, int cy, bool left, bool enabled, bool hot)
-        {
-            Color c = !enabled ? Color.FromArgb(80, 80, 80) : hot ? Color.White : Color.FromArgb(190, 190, 190);
-            using (Pen p = new Pen(c, 2f))
-            {
-                int d = left ? 1 : -1;
-                g.DrawLine(p, cx + 4 * d, cy - 8, cx - 4 * d, cy);
-                g.DrawLine(p, cx - 4 * d, cy, cx + 4 * d, cy + 8);
-            }
-        }
-
-        int HitAt(Point p) { if (p.X >= 8 && p.X < 38) return 1; if (p.X >= 38 && p.X < 68) return 2; if (p.X >= Width - 190) return 3; return 0; }
         protected override void OnMouseMove(MouseEventArgs e)
         {
-            int h = HitAt(e.Location);
-            if (h != _hot) { _hot = h; Invalidate(); }
             UpdateSearchHot();
-            Cursor = h == 3 ? Cursors.Hand : _searchHot ? Cursors.IBeam : Cursors.Default;
+            bool hh = HomeRect.Contains(e.Location);
+            if (hh != _homeHot) { _homeHot = hh; Invalidate(); }
+            Cursor = hh || (SearchBox.TextLength > 0 && ClearRect.Contains(e.Location)) ? Cursors.Hand : _searchHot ? Cursors.IBeam : Cursors.Default;
             base.OnMouseMove(e);
         }
-        protected override void OnMouseLeave(EventArgs e) { _hot = 0; UpdateSearchHot(); Invalidate(); base.OnMouseLeave(e); }
-        protected override void OnMouseDown(MouseEventArgs e)
-        {
-            if (e.Button == MouseButtons.Left && _searchFrame.Contains(e.Location)) SearchBox.Focus();     // the lens / rim count as the box
-            base.OnMouseDown(e);
-        }
+        protected override void OnMouseLeave(EventArgs e) { UpdateSearchHot(); if (_homeHot) { _homeHot = false; Invalidate(); } base.OnMouseLeave(e); }
         protected override void OnMouseUp(MouseEventArgs e)
         {
-            int h = HitAt(e.Location);
-            if (h == 1 && CanBack && Back != null) Back(this, EventArgs.Empty);
-            if (h == 2 && CanForward && Forward != null) Forward(this, EventArgs.Empty);
-            if (h == 3 && UserMenu != null) UserMenu.Show(this, new Point(Width - 10, Height - 4), ToolStripDropDownDirection.BelowLeft);
+            if (e.Button == MouseButtons.Left && HomeRect.Contains(e.Location) && HomeClicked != null) HomeClicked(this, EventArgs.Empty);
             base.OnMouseUp(e);
+        }
+        Rectangle ClearRect { get { return new Rectangle(_searchFrame.Right - 28, _searchFrame.Top, 24, _searchFrame.Height); } }
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            if (e.Button == MouseButtons.Left && _searchFrame.Contains(e.Location))
+            {
+                if (SearchBox.TextLength > 0 && ClearRect.Contains(e.Location)) SearchBox.Text = "";
+                SearchBox.Focus();                                     // the lens / rim count as the box
+            }
+            base.OnMouseDown(e);
         }
     }
 
@@ -574,7 +555,7 @@ namespace Spotipaq
         public NowPlayingBar()
         {
             SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
-            BackColor = Theme.Bar;
+            BackColor = Theme.Window;
             Height = 74;
         }
 
@@ -586,36 +567,45 @@ namespace Spotipaq
         Rectangle RepeatRect { get { return new Rectangle(Cx + 80, 13, 24, 24); } }
         Rectangle SeekRect { get { int w = Math.Min(560, Width - 520); return new Rectangle(Cx - w / 2, 50, Math.Max(80, w), 14); } }
         Rectangle VolRect { get { return new Rectangle(Width - 120, 31, 96, 12); } }
-        Rectangle TitleRect { get { return new Rectangle(78, 18, Math.Max(10, Cx - 140 - 78), 18); } }
-        Rectangle ArtistRect { get { return new Rectangle(78, 38, Math.Max(10, Cx - 140 - 78), 18); } }
+        // Title and artist sit in the top part of the bar, clear of the seek row's time label (which starts at y 48),
+        // and end 20 px before the leftmost control (shuffle) however long they are.
+        int TextRight { get { return ShuffleRect.Left - 20; } }
+        Rectangle TitleRect { get { return new Rectangle(78, 12, Math.Max(10, TextRight - 78), 18); } }
+        Rectangle ArtistRect { get { return new Rectangle(78, 30, Math.Max(10, TextRight - 78), 16); } }
 
         protected override void OnPaint(PaintEventArgs e)
         {
             Graphics g = e.Graphics;
-            g.Clear(Theme.Bar);
-            using (Pen top = new Pen(Color.FromArgb(20, 20, 20))) g.DrawLine(top, 0, 0, Width, 0);
+            g.Clear(Theme.Window);
 
             if (Track != null)
             {
                 Theme.Art(g, Images == null ? null : Images.Get(Track.AlbumImageUrl, 56, 56), new Rectangle(10, 9, 56, 56), false);
                 LinkText(g, Track.Name, Theme.NormalBold, TitleRect, Theme.Text, _hot == "title");
-                LinkText(g, Track.ArtistName, Theme.Small, ArtistRect, Theme.SubText, _hot == "artist");
+                LinkText(g, Track.ArtistName, Theme.BarArtist, ArtistRect, Theme.SubText, _hot == "artist");
             }
 
             g.SmoothingMode = SmoothingMode.AntiAlias;
-            Color idle = Color.FromArgb(190, 190, 190);
+            Color idle = Color.FromArgb(179, 179, 179);      // every control: grey at rest, white under the pointer
             // play / pause: white outlined circle (1.0 style)
-            using (Pen ring = new Pen(_hot == "play" ? Color.White : idle, 1.6f)) g.DrawEllipse(ring, PlayRect);
-            using (SolidBrush b = new SolidBrush(_hot == "play" ? Color.White : idle))
+            // play / pause: a solid white disc, always white; it grows by a pixel all round under the pointer
+            Rectangle disc = PlayRect;
+            if (_hot == "play") disc.Inflate(1, 1);
+            using (SolidBrush white = new SolidBrush(Color.White)) g.FillEllipse(white, disc);
+            using (SolidBrush b = new SolidBrush(Theme.Window))
             {
                 int cx = PlayRect.Left + 17, cy = PlayRect.Top + 17;
-                if (Playing) { g.FillRectangle(b, cx - 6, cy - 7, 4, 14); g.FillRectangle(b, cx + 2, cy - 7, 4, 14); }
-                else g.FillPolygon(b, new Point[] { new Point(cx - 4, cy - 8), new Point(cx + 8, cy), new Point(cx - 4, cy + 8) });
+                if (Playing) { g.FillRectangle(b, cx - 5, cy - 6, 4, 12); g.FillRectangle(b, cx + 2, cy - 6, 4, 12); }
+                else g.FillPolygon(b, new Point[] { new Point(cx - 4, cy - 7), new Point(cx + 7, cy), new Point(cx - 4, cy + 7) });
             }
-            SkipGlyph(g, PrevRect, false, _hot == "prev" ? Color.White : idle);
-            SkipGlyph(g, NextRect, true, _hot == "next" ? Color.White : idle);
-            ShuffleGlyph(g, ShuffleRect, Shuffle ? Theme.Accent : _hot == "shuffle" ? Color.White : idle);
-            RepeatGlyph(g, RepeatRect, RepeatMode, RepeatMode != 0 ? Theme.Accent : _hot == "repeat" ? Color.White : idle);
+            // icons from the exe (Glyphs); the hand-drawn shapes are the fallback if one is missing
+            Color cPrev = _hot == "prev" ? Color.White : idle, cNext = _hot == "next" ? Color.White : idle;
+            Color cShuffle = Shuffle ? Theme.Accent : _hot == "shuffle" ? Color.White : idle;
+            Color cRepeat = RepeatMode != 0 ? Theme.Accent : _hot == "repeat" ? Color.White : idle;
+            if (!Glyphs.Draw(g, "ic_prev", PrevRect, cPrev)) SkipGlyph(g, PrevRect, false, cPrev);
+            if (!Glyphs.Draw(g, "ic_next", NextRect, cNext)) SkipGlyph(g, NextRect, true, cNext);
+            if (!Glyphs.Draw(g, "ic_shuffle", ShuffleRect, cShuffle)) ShuffleGlyph(g, ShuffleRect, cShuffle);
+            if (!Glyphs.Draw(g, RepeatMode == 2 ? "ic_repeat1" : "ic_repeat", RepeatRect, cRepeat)) RepeatGlyph(g, RepeatRect, RepeatMode, cRepeat);
             g.SmoothingMode = SmoothingMode.None;
 
             // seek bar + times
@@ -628,7 +618,10 @@ namespace Spotipaq
 
             // volume
             Rectangle v = VolRect;
-            SpeakerGlyph(g, new Rectangle(v.Left - 26, v.Top - 6, 22, 22), idle);
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            Color cMute = _hot == "mute" ? Color.White : idle;
+            if (!Glyphs.Draw(g, Volume <= 0 ? "ic_mute" : "ic_vol", MuteRect, cMute)) SpeakerGlyph(g, MuteRect, cMute, Volume <= 0);
+            g.SmoothingMode = SmoothingMode.None;
             Bar(g, v, Volume / 100f, _hot == "vol" || _dragVol);
         }
 
@@ -646,9 +639,9 @@ namespace Spotipaq
         {
             frac = Math.Max(0f, Math.Min(1f, frac));
             int y = r.Top + r.Height / 2 - 2;
-            using (SolidBrush rail = new SolidBrush(Color.FromArgb(80, 80, 80))) g.FillRectangle(rail, r.Left, y, r.Width, 4);
+            Theme.FillRounded(g, new Rectangle(r.Left, y, r.Width, 4), 2, Color.FromArgb(80, 80, 80));
             int fx = r.Left + (int)(r.Width * frac);
-            using (SolidBrush played = new SolidBrush(hot ? Theme.Accent : Color.FromArgb(170, 170, 170))) g.FillRectangle(played, r.Left, y, fx - r.Left, 4);
+            if (fx > r.Left) Theme.FillRounded(g, new Rectangle(r.Left, y, Math.Max(4, fx - r.Left), 4), 2, hot ? Theme.Accent : Color.FromArgb(170, 170, 170));
             if (hot)
             {
                 g.SmoothingMode = SmoothingMode.AntiAlias;
@@ -716,11 +709,36 @@ namespace Spotipaq
                 }
             }
         }
-        static void SpeakerGlyph(Graphics g, Rectangle r, Color c)
+        // speaker; with sound waves, or a cross when muted
+        static void SpeakerGlyph(Graphics g, Rectangle r, Color c, bool muted)
         {
             using (SolidBrush b = new SolidBrush(c))
                 g.FillPolygon(b, new Point[] { new Point(r.Left + 3, r.Top + 8), new Point(r.Left + 7, r.Top + 8), new Point(r.Left + 12, r.Top + 3), new Point(r.Left + 12, r.Top + 19), new Point(r.Left + 7, r.Top + 14), new Point(r.Left + 3, r.Top + 14) });
-            using (Pen p = new Pen(c, 1.3f)) g.DrawArc(p, r.Left + 9, r.Top + 6, 8, 10, -60, 120);
+            using (Pen p = new Pen(c, 1.5f))
+            {
+                p.StartCap = LineCap.Round; p.EndCap = LineCap.Round;
+                if (muted)
+                {
+                    g.DrawLine(p, r.Left + 15, r.Top + 8, r.Left + 20, r.Top + 14);
+                    g.DrawLine(p, r.Left + 20, r.Top + 8, r.Left + 15, r.Top + 14);
+                }
+                else
+                {
+                    g.DrawArc(p, r.Left + 9, r.Top + 6, 8, 10, -60, 120);
+                    g.DrawArc(p, r.Left + 8, r.Top + 3, 13, 16, -55, 110);
+                }
+            }
+        }
+
+        // ---- mute: the speaker button drops the volume to 0 and brings the previous level back
+        Rectangle MuteRect { get { Rectangle v = VolRect; return new Rectangle(v.Left - 28, v.Top - 6, 24, 22); } }
+        int _beforeMute = 80;
+        void ToggleMute()
+        {
+            if (Volume > 0) { _beforeMute = Volume; Volume = 0; }
+            else Volume = _beforeMute > 0 ? _beforeMute : 80;
+            if (VolumeChanged != null) VolumeChanged(this, EventArgs.Empty);
+            Invalidate();
         }
 
         string HitAt(Point p)
@@ -731,9 +749,10 @@ namespace Spotipaq
             if (ShuffleRect.Contains(p)) return "shuffle";
             if (RepeatRect.Contains(p)) return "repeat";
             Rectangle s = SeekRect; s.Inflate(0, 4); if (s.Contains(p)) return "seek";
+            if (MuteRect.Contains(p)) return "mute";
             Rectangle v = VolRect; v.Inflate(0, 6); if (v.Contains(p)) return "vol";
             if (Track != null && TitleRect.Contains(p) && p.X < TitleRect.Left + Theme.Measure(Track.Name, Theme.NormalBold).Width) return "title";
-            if (Track != null && ArtistRect.Contains(p) && p.X < ArtistRect.Left + Theme.Measure(Track.ArtistName, Theme.Small).Width) return "artist";
+            if (Track != null && ArtistRect.Contains(p) && p.X < ArtistRect.Left + Theme.Measure(Track.ArtistName, Theme.BarArtist).Width) return "artist";
             return null;
         }
 
@@ -755,7 +774,7 @@ namespace Spotipaq
             if (_dragVol) { SetVolumeAt(e.X); Invalidate(); return; }
             string h = HitAt(e.Location);
             if (h != _hot) { _hot = h; Invalidate(); }
-            Cursor = h != null ? Cursors.Hand : Cursors.Default;
+            Cursor = h != null && h != "seek" && h != "vol" ? Cursors.Hand : Cursors.Default;      // the sliders keep the arrow
             base.OnMouseMove(e);
         }
 
@@ -787,6 +806,7 @@ namespace Spotipaq
                 case "next": Fire(Next); break;
                 case "shuffle": Fire(ShuffleToggled); break;
                 case "repeat": Fire(RepeatToggled); break;
+                case "mute": ToggleMute(); break;
                 case "title": if (LinkClicked != null && Track != null) LinkClicked(this, new NavEventArgs(new NavTarget(PageKind.Album, Track.AlbumId))); break;
                 case "artist": if (LinkClicked != null && Track != null) LinkClicked(this, new NavEventArgs(new NavTarget(PageKind.Artist, Track.ArtistId))); break;
             }

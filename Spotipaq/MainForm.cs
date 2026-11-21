@@ -51,8 +51,8 @@ namespace Spotipaq
             _player = player;
             Text = "Spotipaq";
             FormBorderStyle = FormBorderStyle.None;            // own title bar (TitleBar); edges still resize, see WndProc
-            Padding = new Padding(FrameW);                     // the strip the form itself owns: resize hit-testing
-            BackColor = Theme.Main;
+            BackColor = Theme.Window;
+            SetStyle(ControlStyles.ResizeRedraw, true);        // the 1 px window border
             ForeColor = Theme.Text;
             Font = Theme.Normal;
             ClientSize = new Size(1000, 680);
@@ -75,22 +75,20 @@ namespace Spotipaq
             _images = new ImageCache(backend, this);
             _page = new PageView(this);
 
-            _sidebar.Width = 218; _sidebar.Dock = DockStyle.Left;
-            _top.Dock = DockStyle.Top;
-            _bar.Dock = DockStyle.Bottom;
-            _page.Dock = DockStyle.Fill;
+            _title.Dock = DockStyle.None;                      // everything is placed by ArrangeChrome
             _bar.Images = _images;
-            Controls.Add(_page); Controls.Add(_sidebar); Controls.Add(_top); Controls.Add(_bar); Controls.Add(_title);   // z-order: fill added first, title bar docks first
+            _sidebar.Images = _images;
+            Controls.Add(_page); Controls.Add(_sidebar); Controls.Add(_top); Controls.Add(_bar); Controls.Add(_title);
+            ArrangeChrome();
 
-            _images.Loaded += delegate { _page.Invalidate(); _bar.Invalidate(); };
+            _images.Loaded += delegate { _page.Invalidate(); _bar.Invalidate(); _sidebar.Invalidate(); };
             _sidebar.ItemClicked += delegate (object s, NavEventArgs e) { Navigate(e.Target); };
             _sidebar.ItemContext += delegate (object s, NavEventArgs e) { ShowNavMenu(e.Target); };
-            _sidebar.LibraryCollapsed = _settings.GetBool("sidebar.libraryCollapsed", false);
-            _sidebar.LibraryToggled += delegate { _settings.Set("sidebar.libraryCollapsed", _sidebar.LibraryCollapsed); _settings.Save(); };
             _sidebar.PlaylistsReordered += delegate (object s, OrderEventArgs e) { _settings.Set("playlistOrder", String.Join(",", e.Ids.ToArray())); _settings.Save(); };
-            _top.Back += delegate { Go(_historyIndex - 1); };
-            _top.Forward += delegate { Go(_historyIndex + 1); };
+            _page.Back += delegate { Go(_historyIndex - 1); };
+            _page.Forward += delegate { Go(_historyIndex + 1); };
             BuildUserMenu();
+            _top.HomeClicked += delegate { Navigate(new NavTarget(PageKind.Browse, null)); };
             _top.SearchRequested += delegate (object s, SearchEventArgs e) { Navigate(new NavTarget(PageKind.Search, e.Query)); };
             _bar.PlayPause += delegate { TogglePlayPause(); };
             _bar.Next += delegate { Skip(1, true); };
@@ -147,7 +145,7 @@ namespace Spotipaq
         {
             // The owner-drawn bars never take the keyboard focus, so a click on them would leave it in the search box:
             // hand it to the page instead (clicks on the search box's own outline / lens keep it).
-            if ((m.Msg == 0x0201 || m.Msg == 0x0204) && _top.SearchBox.Focused &&            // WM_LBUTTONDOWN / WM_RBUTTONDOWN
+            if ((m.Msg == 0x0201 || m.Msg == 0x0204) && (_top.SearchBox.Focused || _page.InputFocused) &&            // WM_LBUTTONDOWN / WM_RBUTTONDOWN
                 (m.HWnd == _title.Handle || m.HWnd == _sidebar.Handle || m.HWnd == _bar.Handle ||
                  (m.HWnd == _top.Handle && !_top.SearchFrame.Contains(_top.PointToClient(Cursor.Position)))))
                 _page.Focus();
@@ -215,7 +213,33 @@ namespace Spotipaq
         }
 
         // ---- borderless window: styles, edge resizing, frame, and the window (taskbar) menu
-        const int FrameW = 3;
+        // Layout: black window with a 1 px border; title bar on top, player bar at the bottom, and between them three
+        // rounded cards - search and library on the left, the page on the right - with black gaps around them.
+        // Edge = the border plus a few black pixels the form itself owns all round: that strip is the resize grip.
+        const int Edge = 4, Gap = 8, LeftW = 240;
+        static readonly Color BorderColor = Color.FromArgb(56, 56, 56);
+
+        void ArrangeChrome()
+        {
+            if (_title == null || _page == null) return;
+            int w = ClientSize.Width, h = ClientSize.Height;
+            if (w <= 0 || h <= 0) return;                                  // minimized
+            int e = WindowState == FormWindowState.Maximized ? 0 : Edge;
+            _title.SetBounds(e, e, w - 2 * e, _title.Height);
+            _bar.SetBounds(e, h - e - _bar.Height, w - 2 * e, _bar.Height);
+            int top = e + _title.Height + 2, bottom = h - e - _bar.Height - 4;
+            _top.SetBounds(Gap, top, LeftW, _top.Height);          // Home + search card
+            int libTop = top + _top.Height + Gap;
+            _sidebar.SetBounds(Gap, libTop, LeftW, Math.Max(0, bottom - libTop));
+            int px = Gap + LeftW + Gap;
+            _page.SetBounds(px, top, Math.Max(0, w - Gap - px), Math.Max(0, bottom - top));
+        }
+
+        protected override void OnLayout(LayoutEventArgs levent)
+        {
+            base.OnLayout(levent);
+            ArrangeChrome();
+        }
         const int WM_NCHITTEST = 0x0084, WM_SYSMENU = 0x0313, WM_SYSCOMMAND = 0x0112;
         const int HTCLIENT = 1, HTLEFT = 10, HTRIGHT = 11, HTTOP = 12, HTTOPLEFT = 13, HTTOPRIGHT = 14, HTBOTTOM = 15, HTBOTTOMLEFT = 16, HTBOTTOMRIGHT = 17;
         const int SC_SIZE = 0xF000, SC_MOVE = 0xF010, SC_MINIMIZE = 0xF020, SC_MAXIMIZE = 0xF030, SC_CLOSE = 0xF060, SC_RESTORE = 0xF120;
@@ -358,10 +382,12 @@ namespace Spotipaq
             }
         }
 
-        // the frame strip around the content (the children cover everything else)
+        // everything the cards and bars don't cover: black, with the window's 1 px border (none while maximized)
         protected override void OnPaintBackground(PaintEventArgs e)
         {
-            using (SolidBrush b = new SolidBrush(TitleBar.BarColor)) e.Graphics.FillRectangle(b, ClientRectangle);
+            e.Graphics.Clear(Theme.Window);
+            if (WindowState != FormWindowState.Maximized)
+                using (Pen p = new Pen(BorderColor)) e.Graphics.DrawRectangle(p, 0, 0, ClientSize.Width - 1, ClientSize.Height - 1);
         }
 
         // The window menu: on a right-click of the taskbar button (WM_SYSMENU) or of the title bar. A borderless form
@@ -516,10 +542,8 @@ namespace Spotipaq
 
         protected override void OnResize(EventArgs e)
         {
-            // no resize frame while maximized: the content goes right to the screen edges
-            Padding want = WindowState == FormWindowState.Maximized ? Padding.Empty : new Padding(FrameW);
-            if (Padding != want) Padding = want;
             base.OnResize(e);
+            ArrangeChrome();
             if (_title != null) _title.Invalidate();           // maximize <-> restore glyph
             TrackWindow();
         }
@@ -550,15 +574,15 @@ namespace Spotipaq
             if (_settings.GetBool("win.max", false)) WindowState = FormWindowState.Maximized;
             TrackWindow();
             _sidebar.SetPlaylists(null);
-            _top.SetUser("Connecting...");
+            _page.SetUser("Connecting...");
             _bar.Volume = _player.Volume;
             RefreshBar();
             Async.Run(this, delegate { return _backend.GetUser(); }, delegate (UserInfo u, Exception err)
             {
-                if (u != null) _top.SetUser(u.Name);
+                if (u != null) _page.SetUser(u.Name);
                 else
                 {
-                    _top.SetUser("Offline");
+                    _page.SetUser("Offline");
                     if (err != null)
                         MessageBox.Show(this, "Couldn't connect to Spotify:\r\n\r\n" + err.Message + "\r\n\r\nDetails: " + Engine.Log.FilePath,
                             "Spotipaq", MessageBoxButtons.OK, MessageBoxIcon.Warning);
@@ -640,7 +664,7 @@ namespace Spotipaq
                 LogOutRequested = true;
                 Close();
             });
-            _top.UserMenu = m;
+            _page.UserMenu = m;
         }
 
         /// <summary>Brings back the previous run's play queue, so play / next / previous carry on through the same
@@ -792,10 +816,11 @@ namespace Spotipaq
         {
             if (index < 0 || index >= _history.Count) return;
             _historyIndex = index;
-            _top.CanBack = index > 0;
-            _top.CanForward = index < _history.Count - 1;
-            _top.Invalidate();
+            _page.CanBack = index > 0;
+            _page.CanForward = index < _history.Count - 1;
+            _page.Invalidate();
             _sidebar.SetCurrent(Current);
+            _top.HomeActive = Current != null && Current.Kind == PageKind.Browse;
             ShowPage(Current);
         }
 
@@ -1029,6 +1054,7 @@ namespace Spotipaq
                 _queueDirty = true;
             }
             RefreshBar();
+            _page.Invalidate();                 // a playlist page shows the shuffle state too
         }
 
         void PlayAt(int orderPos)
@@ -1069,14 +1095,15 @@ namespace Spotipaq
             _bar.RepeatMode = _repeatMode;
             if (!_bar.DraggingVolume) _bar.Volume = _player.Volume;
             _bar.Invalidate();
-            string title = t == null ? "Spotipaq" : t.ArtistName + " - " + t.Name;
+            string title = t == null ? "Spotipaq" : Emoji.Strip(t.ArtistName + " - " + t.Name);      // Windows can't draw emoji in the taskbar
+            if (title.Length == 0 || title == "-") title = "Spotipaq";
             if (Text != title) Text = title;
         }
 
         // ============================================================================ keyboard
         protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
         {
-            bool typing = _top.SearchBox.Focused;
+            bool typing = _top.SearchBox.Focused || _page.InputFocused;
             if (keyData == Keys.Space && !typing) { TogglePlayPause(); return true; }
             if (keyData == (Keys.Control | Keys.Right)) { Skip(1, true); return true; }
             if (keyData == (Keys.Control | Keys.Left)) { Previous(); return true; }
@@ -1119,7 +1146,7 @@ namespace Spotipaq
         {
             switch (t.Kind)
             {
-                case PageKind.Browse: LoadPage("Browse", delegate { return _backend.GetBrowse(); }, delegate (List<BrowseSection> r, Exception e) { _page.SetBlocks(BrowsePage(r)); }); break;
+                case PageKind.Browse: LoadPage("Home", delegate { return _backend.GetBrowse(); }, delegate (List<BrowseSection> r, Exception e) { _page.SetBlocks(BrowsePage(r)); }); break;
                 case PageKind.Search: LoadPage("results", delegate { return _backend.Search(t.Id); }, delegate (SearchResults r, Exception e) { _page.SetBlocks(SearchPage(r)); }); break;
                 case PageKind.Album: LoadPage("album", delegate { return _backend.GetAlbum(t.Id); }, delegate (Album r, Exception e) { _page.SetBlocks(AlbumPage(r)); PlayLinkedPage("album", t.Id, r.Tracks); }); break;
                 case PageKind.Artist: LoadPage("artist", delegate { return _backend.GetArtist(t.Id); }, delegate (ArtistPage r, Exception e) { _page.SetBlocks(ArtistPageBlocks(r)); PlayLinkedPage("artist", t.Id, r.Popular); }); break;
@@ -1136,17 +1163,17 @@ namespace Spotipaq
         static Tile ArtistTile(Artist a) { return new Tile(a.Name, "Artist", a.ImageUrl, true, new NavTarget(PageKind.Artist, a.Id)); }
 
         static int TotalMinutes(List<Track> tracks) { long ms = 0; foreach (Track t in tracks) ms += t.DurationMs; return (int)(ms / 60000); }
-        static string Length(List<Track> tracks)
+        static string SongCount(List<Track> tracks) { return tracks.Count + (tracks.Count == 1 ? " song" : " songs"); }
+        static string Duration(List<Track> tracks)
         {
             int min = TotalMinutes(tracks);
-            string songs = tracks.Count + (tracks.Count == 1 ? " song" : " songs");
-            return min >= 60 ? songs + ", " + min / 60 + " hr " + min % 60 + " min" : songs + ", " + min + " min";
+            return min >= 60 ? min / 60 + " hr " + min % 60 + " min" : min + " min";
         }
 
         List<Block> BrowsePage(List<BrowseSection> sections)
         {
             List<Block> b = new List<Block>();
-            b.Add(new SectionBlock("Browse", true));
+            b.Add(new SectionBlock("Home", true));
             foreach (BrowseSection s in sections)
             {
                 List<Tile> tiles = new List<Tile>();
@@ -1195,10 +1222,10 @@ namespace Spotipaq
         {
             List<Block> b = new List<Block>();
             List<PageButton> buttons = new List<PageButton>();
-            buttons.Add(new PageButton("PLAY", true, 104, delegate { PlayList(a.Tracks, 0); }));
+            buttons.Add(new PageButton("PLAY", true, 44, "play", delegate { PlayList(a.Tracks, 0); }));
             buttons.Add(new PageButton("SAVE", false, 100, null));
-            b.Add(new HeaderBlock(a.Type, a.Name, a.ArtistName, new NavTarget(PageKind.Artist, a.ArtistId),
-                (a.Year > 0 ? a.Year + " • " : "") + Length(a.Tracks), a.ImageUrl, buttons));
+            b.Add(new HeaderBlock(a.Type, a.Name, null, a.ArtistName, new NavTarget(PageKind.Artist, a.ArtistId),
+                new string[] { a.Year > 0 ? a.Year.ToString() : null, SongCount(a.Tracks) }, ", " + Duration(a.Tracks), a.ImageUrl, buttons));
             b.Add(new TrackListBlock(a.Tracks, TrackColumns.Number | TrackColumns.Popularity, true));
             return b;
         }
@@ -1213,13 +1240,14 @@ namespace Spotipaq
         {
             List<Block> b = new List<Block>();
             List<PageButton> buttons = new List<PageButton>();
-            buttons.Add(new PageButton("PLAY", true, 104, delegate { PlayList(p.Tracks, 0); }));
-            if (_libraryIds.ContainsKey(p.Id)) buttons.Add(new PageButton("SHARE", false, 100, delegate { CopyText("https://open.spotify.com/playlist/" + p.Id); }));
-            else buttons.Add(new PageButton("SAVE", false, 100, delegate { SavePlaylistToLibrary(p); }));
-            b.Add(new HeaderBlock("PLAYLIST", p.Name, null, null,
-                "Created by " + OwnerName(p) + " • " + Length(p.Tracks), p.ImageUrl, buttons));
-            if (!String.IsNullOrEmpty(p.Description)) b.Add(new TextBlock(p.Description));
-            b.Add(new TrackListBlock(p.Tracks, TrackColumns.Number | TrackColumns.Artist | TrackColumns.Album | TrackColumns.Art, true));
+            buttons.Add(new PageButton("PLAY", true, 44, "play", delegate { PlayList(p.Tracks, 0); }));
+            PageButton shuffle = new PageButton("SHUFFLE", false, 36, "ic_shuffle_big", delegate { SetShuffle(!_shuffle); });
+            shuffle.On = delegate { return _shuffle; };
+            buttons.Add(shuffle);
+            if (!_libraryIds.ContainsKey(p.Id)) buttons.Add(new PageButton("SAVE", false, 100, delegate { SavePlaylistToLibrary(p); }));
+            b.Add(new HeaderBlock("PLAYLIST", p.Name, p.Description, OwnerName(p), null,
+                new string[] { SongCount(p.Tracks) }, ", " + Duration(p.Tracks), p.ImageUrl, buttons));
+            b.Add(new TrackListBlock(p.Tracks, TrackColumns.Number | TrackColumns.Artist | TrackColumns.Album | TrackColumns.Art | TrackColumns.Search, true));
             return b;
         }
 
@@ -1227,7 +1255,7 @@ namespace Spotipaq
         {
             List<Block> b = new List<Block>();
             List<PageButton> buttons = new List<PageButton>();
-            buttons.Add(new PageButton("PLAY", true, 104, delegate { PlayList(page.Popular, 0); }));
+            buttons.Add(new PageButton("PLAY", true, 44, "play", delegate { PlayList(page.Popular, 0); }));
             buttons.Add(new PageButton("FOLLOW", false, 100, null));
             b.Add(new ArtistHeaderBlock(page.Artist, buttons));
             if (page.Popular.Count > 0)
@@ -1257,7 +1285,7 @@ namespace Spotipaq
         {
             List<Block> b = new List<Block>();
             b.Add(new SectionBlock("Liked Songs", true));
-            b.Add(new TrackListBlock(tracks, TrackColumns.Art | TrackColumns.Artist | TrackColumns.Album, true));
+            b.Add(new TrackListBlock(tracks, TrackColumns.Art | TrackColumns.Artist | TrackColumns.Album | TrackColumns.Search, true));
             return b;
         }
 

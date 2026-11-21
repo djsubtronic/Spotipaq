@@ -18,7 +18,9 @@ namespace Spotipaq
     {
         public static readonly Color Accent = Color.FromArgb(29, 185, 84);        // #1DB954
         public static readonly Color AccentHover = Color.FromArgb(30, 215, 96);   // #1ED760
-        public static readonly Color Main = Color.FromArgb(24, 24, 24);           // content area
+        public static readonly Color Window = Color.Black;                        // behind the cards: title bar, player bar, gaps
+        public static readonly Color Main = Color.FromArgb(18, 18, 18);           // content card
+        public const int CardRadius = 8;                                          // corner radius of the cards
         public static readonly Color Sidebar = Color.FromArgb(18, 18, 18);
         public static readonly Color Bar = Color.FromArgb(40, 40, 40);            // top + bottom bars
         public static readonly Color RowHover = Color.FromArgb(51, 51, 51);
@@ -29,13 +31,16 @@ namespace Spotipaq
         public static readonly Color DimText = Color.FromArgb(110, 110, 110);
         public static readonly Color Placeholder = Color.FromArgb(62, 62, 62);
 
+        // First choice: Figtree (the closest free match to Spotify's own typeface), if installed. Otherwise as before -
         // Text: Segoe UI Variable's "Text" optical size; big titles: its "Display" size. GDI+ (.NET 2.0) can't pick
         // variable-font axes, but the named instances appear as separate families. Fallbacks only matter on
         // machines without it.
-        public static readonly string FontFamilyName = PickFamily("Segoe UI Variable Text", "Segoe UI Variable", "Segoe UI", "Tahoma");
-        public static readonly string DisplayFamilyName = PickFamily("Segoe UI Variable Display", "Segoe UI Variable", "Segoe UI", "Tahoma");
+        public static readonly string FontFamilyName = PickFamily("Figtree", "Segoe UI Variable Text", "Segoe UI Variable", "Segoe UI", "Tahoma");
+        public static readonly string DisplayFamilyName = PickFamily("Figtree", "Segoe UI Variable Display", "Segoe UI Variable", "Segoe UI", "Tahoma");
         public static readonly Font Small = Make(8.25f, FontStyle.Regular);
         public static readonly Font SmallBold = Make(8.25f, FontStyle.Bold);
+        // the artist line in the player bar: one pixel smaller than Small (10 px against 11; text sizes go in whole pixels)
+        public static readonly Font BarArtist = new Font(FontFamilyName, 10f, FontStyle.Regular, GraphicsUnit.Pixel);
         public static readonly Font Normal = Make(9f, FontStyle.Regular);
         public static readonly Font NormalBold = Make(9f, FontStyle.Bold);
         public static readonly Font Heading = Make(12f, FontStyle.Bold);
@@ -86,7 +91,22 @@ namespace Spotipaq
         static bool IsSpecial(char c)
         {
             return (c >= 0xD800 && c <= 0xDFFF) || (c >= 0x2190 && c <= 0x2BFF) || (c >= 0x2E80 && c < 0xD800) ||
-                   (c >= 0xFE00 && c <= 0xFE0F) || c == 0x200D || (c >= 0x2600 && c <= 0x27BF);
+                   (c >= 0xFE00 && c <= 0xFE0F) || c == 0x200D || (c >= 0x2600 && c <= 0x27BF) || c == 0x20E3;
+        }
+
+        /// <summary>True when the text has symbols or emoji, i.e. Draw lays it out run by run instead of handing
+        /// the whole string to TextRenderer.</summary>
+        public static bool IsRich(string s) { return !String.IsNullOrEmpty(s) && HasSpecial(s); }
+
+        /// <summary>Side of the emoji pictures that go with a font: a little taller than its letters. Sizes near
+        /// a sprite sheet's cell snap to it so those are drawn unscaled (the big titles use the 28 px sheet 1:1).</summary>
+        static int EmojiSize(Font f)
+        {
+            float em = f.Unit == GraphicsUnit.Pixel ? f.Size : f.SizeInPoints * 96f / 72f;
+            int s = (int)Math.Round(em * 1.17f);
+            if (s >= 25 && s <= 34) return Emoji.BigCell;
+            if (s >= 22 && s < 25) return Emoji.Cell;
+            return s;
         }
 
         static bool IsInvisible(char c) { return (c >= 0xFE00 && c <= 0xFE0F) || c == 0x200D; }
@@ -104,14 +124,14 @@ namespace Spotipaq
             {
                 if (!_symFonts.TryGetValue(f, out r))
                 {
-                    try { r = new Font(SymbolFamilyName, f.Size, f.Style); } catch { r = f; }
+                    try { r = new Font(SymbolFamilyName, f.SizeInPoints, f.Style); } catch { r = f; }     // in points, whatever unit f was made in
                     _symFonts[f] = r;
                 }
             }
             return r;
         }
 
-        sealed class Run { public string Text; public bool Special; public int Width; }
+        sealed class Run { public string Text; public bool Special; public int Width; public int Cell = -1; }      // Cell >= 0: an emoji picture
 
         static int RunWidth(Graphics g, string s, Font f, bool special)
         {
@@ -132,6 +152,14 @@ namespace Spotipaq
             for (int i = 0; i < text.Length; i++)
             {
                 char ch = text[i];
+                int elen, cell = Emoji.Match(text, i, out elen);
+                if (cell >= 0 && elen > 0)                       // an emoji (possibly several characters) -> one picture
+                {
+                    if (sb.Length > 0) { runs.Add(new Run { Text = sb.ToString(), Special = special }); sb.Length = 0; }
+                    runs.Add(new Run { Text = text.Substring(i, elen), Special = true, Cell = cell });
+                    i += elen - 1;
+                    continue;
+                }
                 if (IsInvisible(ch)) continue;
                 bool sp = IsSpecial(ch);
                 if (sp != special && sb.Length > 0) { runs.Add(new Run { Text = sb.ToString(), Special = special }); sb.Length = 0; }
@@ -139,7 +167,8 @@ namespace Spotipaq
                 sb.Append(ch);
             }
             if (sb.Length > 0) runs.Add(new Run { Text = sb.ToString(), Special = special });
-            foreach (Run r in runs) r.Width = RunWidth(g, r.Text, f, r.Special);
+            int esize = EmojiSize(f);
+            foreach (Run r in runs) r.Width = r.Cell >= 0 ? esize + 2 : RunWidth(g, r.Text, f, r.Special);
             return runs;
         }
 
@@ -171,7 +200,7 @@ namespace Spotipaq
                 foreach (Run run in runs)
                 {
                     if (used + run.Width <= budget) { kept.Add(run); used += run.Width; continue; }
-                    string s = run.Text;
+                    string s = run.Cell >= 0 ? "" : run.Text;          // a picture goes whole or not at all
                     while (s.Length > 0 && used + RunWidth(g, s, f, run.Special) > budget)
                     {
                         s = s.Substring(0, s.Length - 1);
@@ -192,8 +221,19 @@ namespace Spotipaq
             Region oldClip = g.Clip;
             g.SetClip(r, CombineMode.Intersect);
             TextRenderingHint oldHint = g.TextRenderingHint;
+            int esize = EmojiSize(f);
             foreach (Run run in runs)
             {
+                if (run.Cell >= 0)
+                {
+                    Bitmap pic = Emoji.Get(run.Cell, esize);
+                    if (pic != null)
+                    {
+                        g.DrawImageUnscaled(pic, x + 1, y + (lineH - esize) / 2);
+                        x += run.Width;
+                        continue;
+                    }
+                }
                 if (run.Special)
                 {
                     g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
@@ -220,6 +260,54 @@ namespace Spotipaq
             int s = Math.Max(0, ms / 1000);
             return s >= 3600 ? String.Format("{0}:{1:00}:{2:00}", s / 3600, s / 60 % 60, s % 60)
                              : String.Format("{0}:{1:00}", s / 60, s % 60);
+        }
+
+        /// <summary>Turns a control into a rounded card: paints the four corners outside the rounding in the colour
+        /// behind it (call last in OnPaint, with the control's client rectangle).</summary>
+        public static void CardCorners(Graphics g, Rectangle r, int rad, Color outside)
+        {
+            if (r.Width < rad * 2 || r.Height < rad * 2) return;
+            int d = rad * 2, x = r.Left, y = r.Top, x2 = r.Right, y2 = r.Bottom;
+            SmoothingMode sm = g.SmoothingMode; PixelOffsetMode po = g.PixelOffsetMode;
+            g.SmoothingMode = SmoothingMode.AntiAlias; g.PixelOffsetMode = PixelOffsetMode.Half;
+            using (SolidBrush b = new SolidBrush(outside))
+            using (GraphicsPath p = new GraphicsPath())
+            {
+                p.StartFigure(); p.AddLine(x, y + rad, x, y); p.AddLine(x, y, x + rad, y); p.AddArc(x, y, d, d, 270, -90); p.CloseFigure();
+                p.StartFigure(); p.AddLine(x2 - rad, y, x2, y); p.AddLine(x2, y, x2, y + rad); p.AddArc(x2 - d, y, d, d, 0, -90); p.CloseFigure();
+                p.StartFigure(); p.AddLine(x2, y2 - rad, x2, y2); p.AddLine(x2, y2, x2 - rad, y2); p.AddArc(x2 - d, y2 - d, d, d, 90, -90); p.CloseFigure();
+                p.StartFigure(); p.AddLine(x + rad, y2, x, y2); p.AddLine(x, y2, x, y2 - rad); p.AddArc(x, y2 - d, d, d, 180, -90); p.CloseFigure();
+                g.FillPath(b, p);
+            }
+            g.SmoothingMode = sm; g.PixelOffsetMode = po;
+        }
+
+        /// <summary>Rectangle with rounded corners of the given radius.</summary>
+        public static GraphicsPath Rounded(Rectangle r, int rad)
+        {
+            GraphicsPath p = new GraphicsPath();
+            int d = rad * 2;
+            p.AddArc(r.Left, r.Top, d, d, 180, 90);
+            p.AddArc(r.Right - d, r.Top, d, d, 270, 90);
+            p.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
+            p.AddArc(r.Left, r.Bottom - d, d, d, 90, 90);
+            p.CloseFigure();
+            return p;
+        }
+
+        /// <summary>Fills a gently rounded rectangle (smooth corners, crisp straight edges).</summary>
+        public static void FillRounded(Graphics g, Rectangle r, int rad, Color c)
+        {
+            if (r.Width <= 0 || r.Height <= 0) return;
+            rad = Math.Min(rad, Math.Min(r.Width, r.Height) / 2);
+            using (SolidBrush b = new SolidBrush(c))
+            {
+                if (rad <= 0) { g.FillRectangle(b, r); return; }
+                SmoothingMode sm = g.SmoothingMode; PixelOffsetMode po = g.PixelOffsetMode;
+                g.SmoothingMode = SmoothingMode.AntiAlias; g.PixelOffsetMode = PixelOffsetMode.Half;
+                using (GraphicsPath p = Rounded(r, rad)) g.FillPath(b, p);
+                g.SmoothingMode = sm; g.PixelOffsetMode = po;
+            }
         }
 
         public static GraphicsPath Pill(Rectangle r)
@@ -249,15 +337,19 @@ namespace Spotipaq
                 TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
         }
 
-        /// <summary>Draws an image scaled to fill r (centre-cropped), or a grey record placeholder.</summary>
+        /// <summary>Corner radius for square artwork of this size: 2 px on the small row thumbnails, up to 6 px on big covers.</summary>
+        public static int ArtRadius(int size) { return Math.Max(2, Math.Min(6, size / 14)); }
+
+        /// <summary>Draws an image scaled to fill r (centre-cropped), or a grey record placeholder. Square artwork has
+        /// slightly rounded corners: ImageCache cuts them into the thumbnail once, so drawing costs nothing extra.</summary>
         public static void Art(Graphics g, Image img, Rectangle r, bool round)
         {
             if (img == null)
             {
-                using (SolidBrush b = new SolidBrush(Placeholder))
+                if (!round) FillRounded(g, r, ArtRadius(r.Width), Placeholder);
+                else using (SolidBrush b = new SolidBrush(Placeholder))
                 {
-                    if (round) { g.SmoothingMode = SmoothingMode.AntiAlias; g.FillEllipse(b, r); g.SmoothingMode = SmoothingMode.None; }
-                    else g.FillRectangle(b, r);
+                    g.SmoothingMode = SmoothingMode.AntiAlias; g.FillEllipse(b, r); g.SmoothingMode = SmoothingMode.None;
                 }
                 int d = Math.Max(4, r.Width / 5);
                 using (SolidBrush hole = new SolidBrush(Color.FromArgb(40, 40, 40)))
@@ -391,7 +483,23 @@ namespace Spotipaq
                                           : new RectangleF(0, (src.Height - src.Width / da) / 2, src.Width, src.Width / da);
                 g.DrawImage(src, new Rectangle(0, 0, w, h), from, GraphicsUnit.Pixel);
             }
-            return dst;
+            if (w != h) return dst;                    // banners stay square-cornered
+            // square artwork: round the corners here, once, on the loader thread (transparent, anti-aliased)
+            Bitmap round = new Bitmap(w, h, PixelFormat.Format32bppPArgb);
+            try
+            {
+                using (Graphics g = Graphics.FromImage(round))
+                using (TextureBrush tb = new TextureBrush(dst))
+                using (GraphicsPath p = Theme.Rounded(new Rectangle(0, 0, w, h), Theme.ArtRadius(w)))
+                {
+                    g.SmoothingMode = SmoothingMode.AntiAlias;
+                    g.PixelOffsetMode = PixelOffsetMode.Half;
+                    g.FillPath(tb, p);
+                }
+            }
+            catch (Exception) { round.Dispose(); return dst; }
+            dst.Dispose();
+            return round;
         }
 
         void Worker()
@@ -490,6 +598,185 @@ namespace Spotipaq
                 catch { }
             }
         }
+    }
+
+    /// <summary>The player bar's icons: white shapes embedded in the exe (resources\ic_*.png, from the open-source
+    /// Lucide set), tinted to whatever colour is asked for. Each colour is tinted once and kept.</summary>
+    public static class Glyphs
+    {
+        static readonly Dictionary<string, Bitmap> _masks = new Dictionary<string, Bitmap>();
+        static readonly Dictionary<string, Bitmap> _tinted = new Dictionary<string, Bitmap>();
+
+        /// <summary>Draws the icon centred in r. False when it isn't in the exe (the caller then draws its own shape).</summary>
+        public static bool Draw(Graphics g, string name, Rectangle r, Color c)
+        {
+            Bitmap mask;
+            if (!_masks.TryGetValue(name, out mask))
+            {
+                mask = null;
+                try
+                {
+                    using (Stream st = System.Reflection.Assembly.GetExecutingAssembly().GetManifestResourceStream(name + ".png"))
+                        if (st != null) using (Image img = Image.FromStream(st)) mask = new Bitmap(img);
+                }
+                catch (Exception) { mask = null; }
+                _masks[name] = mask;
+            }
+            if (mask == null) return false;
+            string key = name + "#" + c.ToArgb();
+            Bitmap bmp;
+            if (!_tinted.TryGetValue(key, out bmp))
+            {
+                bmp = new Bitmap(mask.Width, mask.Height, PixelFormat.Format32bppArgb);
+                for (int y = 0; y < mask.Height; y++)
+                    for (int x = 0; x < mask.Width; x++)
+                        bmp.SetPixel(x, y, Color.FromArgb(mask.GetPixel(x, y).A, c));
+                _tinted[key] = bmp;
+            }
+            g.DrawImage(bmp, r.Left + (r.Width - bmp.Width) / 2, r.Top + (r.Height - bmp.Height) / 2, bmp.Width, bmp.Height);
+            return true;
+        }
+    }
+
+    public delegate int ScrollGetter();
+
+    /// <summary>The slim vertical scrollbar the page and the sidebar share: up / down buttons, rounded thumb, drag,
+    /// click on the track to page. The owner keeps the scroll position; this draws at its right edge and handles the mouse.</summary>
+    public sealed class SlimScroll
+    {
+        public const int W = 8;
+        const int BtnH = 11, MinThumb = 30;
+        readonly Control _c;
+        readonly ScrollGetter _get, _max;
+        readonly Action<int> _set;                 // sets the position (the owner clamps it)
+        readonly int _line;                        // pixels per button step
+        readonly Color _track, _thumb, _lit;
+        readonly System.Windows.Forms.Timer _repeat = new System.Windows.Forms.Timer();
+        bool _drag, _engaged;                      // _engaged: the current press started on the bar
+        int _dragOffset;
+        int _held, _hot;                           // -1 up button, +1 down button, 0 neither
+        bool _hotThumb;                            // pointer over the thumb
+        /// <summary>Space left free above and below the bar (the page keeps clear of its header and its rounded bottom corner).</summary>
+        public int TopInset, BottomInset;
+        /// <summary>Part of the owner's height that doesn't show scrolled content (a fixed header above the list).</summary>
+        public int ViewInset;
+
+        public SlimScroll(Control owner, ScrollGetter get, ScrollGetter max, Action<int> set, int line, Color track, Color thumb, Color lit)
+        {
+            _c = owner; _get = get; _max = max; _set = set; _line = line; _track = track; _thumb = thumb; _lit = lit;
+            _repeat.Tick += delegate
+            {
+                if (_held == 0) { _repeat.Stop(); return; }
+                _repeat.Interval = 50;
+                if (_hot != _held) return;         // pointer slid off the button: wait for it to come back
+                _set(_get() + _held * _line);
+                _c.Invalidate();
+            };
+        }
+
+        public bool Shown { get { return _max() > 0; } }
+        int H { get { return _c.ClientSize.Height; } }
+        int View { get { return Math.Max(1, H - ViewInset); } }       // how much scrolled content is visible at once
+        int X { get { return _c.ClientSize.Width - W; } }
+        int Top { get { return TopInset; } }                          // the bar runs from Top to Bottom
+        int Bottom { get { return Math.Max(Top + 2 * BtnH + 1, H - BottomInset); } }
+        int TrackH { get { return Math.Max(1, Bottom - Top - 2 * BtnH); } }
+
+        Rectangle Thumb()
+        {
+            int max = _max(), track = TrackH;
+            int th = Math.Min(track, Math.Max(MinThumb, (int)((long)track * View / Math.Max(1, max + View))));
+            int ty = Top + BtnH + (max <= 0 ? 0 : (int)((long)(track - th) * _get() / max));
+            return new Rectangle(X + 1, ty, W - 2, th);
+        }
+
+        bool Contains(Point p) { return Shown && p.X >= X && p.Y >= Top && p.Y < Bottom; }
+        int ButtonAt(Point p) { if (!Contains(p)) return 0; return p.Y < Top + BtnH ? -1 : p.Y >= Bottom - BtnH ? 1 : 0; }
+
+        public void Paint(Graphics g)
+        {
+            if (!Shown) return;
+            // A transparent track colour means no track at all: whatever the owner painted (the page's gradient, its
+            // solid header) shows through, and the arrows are drawn light so they stand out on any of it.
+            bool clear = _track.A == 0;
+            if (!clear) using (SolidBrush t = new SolidBrush(_track)) g.FillRectangle(t, X, Top, W, Bottom - Top);
+            Color arrow = clear ? Color.FromArgb(190, 190, 190) : _thumb, arrowLit = clear ? Color.White : _lit;
+            // thumb and arrows: lighter under the pointer, white while pressed / dragged
+            Arrow(g, true, _held == -1 ? Color.White : _hot == -1 ? arrowLit : arrow);
+            Arrow(g, false, _held == 1 ? Color.White : _hot == 1 ? arrowLit : arrow);
+            using (SolidBrush tb = new SolidBrush(_drag ? Color.White : _hotThumb ? _lit : _thumb)) g.FillRectangle(tb, Thumb());       // flat, square-cornered
+        }
+
+        // 6 px wide, 3 rows, one pixel narrower per side each row
+        void Arrow(Graphics g, bool up, Color c)
+        {
+            int top = (up ? Top : Bottom - BtnH) + (BtnH - 3) / 2;
+            using (SolidBrush b = new SolidBrush(c))
+                for (int i = 0; i < 3; i++)
+                {
+                    int row = up ? i : 2 - i;
+                    g.FillRectangle(b, X + 3 - row, top + i, 2 + 2 * row, 1);
+                }
+        }
+
+        /// <summary>True when the press was on the scrollbar (the owner should do nothing else with it).</summary>
+        public bool MouseDown(MouseEventArgs e)
+        {
+            if (!Contains(e.Location)) return false;
+            _engaged = true;
+            if (e.Button != MouseButtons.Left) return true;
+            int btn = ButtonAt(e.Location);
+            if (btn != 0)
+            {
+                _held = btn; _hot = btn;
+                _set(_get() + btn * _line);
+                _repeat.Interval = 350;            // hold: repeats after a short pause
+                _repeat.Start();
+                _c.Capture = true;
+            }
+            else
+            {
+                Rectangle t = Thumb();
+                if (e.Y >= t.Top && e.Y < t.Bottom) { _drag = true; _dragOffset = e.Y - t.Top; _c.Capture = true; }
+                else _set(_get() + (e.Y < t.Top ? -View : View));
+            }
+            _c.Invalidate();
+            return true;
+        }
+
+        /// <summary>True while the scrollbar is using the mouse or the pointer is over it.</summary>
+        public bool MouseMove(MouseEventArgs e)
+        {
+            if (_drag)
+            {
+                int room = Math.Max(1, TrackH - Thumb().Height);
+                _set((int)((long)(e.Y - _dragOffset - BtnH - Top) * _max() / room));
+                _c.Invalidate();
+                return true;
+            }
+            int btn = ButtonAt(e.Location);
+            bool onThumb = false;
+            if (btn == 0 && Contains(e.Location)) { Rectangle t = Thumb(); onThumb = e.Y >= t.Top && e.Y < t.Bottom; }
+            if (btn != _hot || onThumb != _hotThumb) { _hot = btn; _hotThumb = onThumb; _c.Invalidate(); }
+            return _held != 0 || Contains(e.Location);
+        }
+
+        /// <summary>True when the release ends a press that began on the scrollbar.</summary>
+        public bool MouseUp(MouseEventArgs e)
+        {
+            if (!_engaged) return false;
+            _engaged = false;
+            if (_drag || _held != 0)
+            {
+                _drag = false; _held = 0;
+                _repeat.Stop();
+                _c.Capture = false;
+            }
+            _c.Invalidate();
+            return true;
+        }
+
+        public void MouseLeave() { if (_hot != 0 || _hotThumb) { _hot = 0; _hotThumb = false; _c.Invalidate(); } }
     }
 
     /// <summary>Dark look for every ContextMenuStrip in the app (set once as ToolStripManager.Renderer).</summary>

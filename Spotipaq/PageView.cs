@@ -32,6 +32,18 @@ namespace Spotipaq
         public virtual void Click(Point p, MouseButtons b, PageView view) { }
         public virtual void DoubleClick(Point p, PageView view) { }
         public virtual bool IsLink(Point p) { return false; }
+        /// <summary>The pointer to show at p (block coordinates); a hand over links unless a block says otherwise.</summary>
+        public virtual Cursor CursorAt(Point p, PageView view) { return IsLink(p) ? Cursors.Hand : Cursors.Default; }
+        /// <summary>The picture this page takes its colour from (its cover / the artist's photo), or null.</summary>
+        public virtual string KeyImageUrl { get { return null; } }
+        /// <summary>For a page's header block: how far down the block its artwork and buttons end. The page's top bar
+        /// is fully solid once that line has scrolled up to the bar's bottom edge. 0 = not a header.</summary>
+        public virtual int HeaderContentBottom { get { return 0; } }
+        /// <summary>Where the page's shared text box goes while this block is using it (block coordinates; the box is
+        /// centred vertically in this area). See PageView.ActivateInput.</summary>
+        public virtual Rectangle InputBounds { get { return Rectangle.Empty; } }
+        /// <summary>The text in the shared box changed while this block owns it.</summary>
+        public virtual void InputChanged(string text, PageView view) { }
     }
 
     public sealed class PageView : Control
@@ -40,9 +52,199 @@ namespace Spotipaq
         readonly IPageHost _host;
         int _scroll, _contentHeight, _layoutWidth = -1;
         Block _hot;
-        bool _dragThumb;
-        int _dragOffset;
-        const int BarW = 8;
+        readonly SlimScroll _bar;
+        const int BarW = SlimScroll.W;
+
+        // ---- header overlay at the top of the card: back / forward on the left, the profile button on the right.
+        // Clear over the page at first; once the page is scrolled it becomes a solid bar in the page's key colour.
+        public const int HeaderH = 52;
+        public bool CanBack, CanForward;
+        public event EventHandler Back, Forward;
+        public ContextMenuStrip UserMenu;      // shown by the profile button
+        string _user = "";
+        public void SetUser(string name) { _user = name ?? ""; }
+        public string User { get { return _user; } }
+        int _hdrHot;                           // 1 back, 2 forward, 3 profile, -1 elsewhere on the header
+        int _solidAt = 120;                    // scroll position at which the bar has faded in completely
+        Rectangle BackRect { get { return new Rectangle(16, 10, 32, 32); } }
+        Rectangle ForwardRect { get { return new Rectangle(56, 10, 32, 32); } }
+        Rectangle UserRect { get { return new Rectangle(ClientSize.Width - BarW - 16 - 32, 10, 32, 32); } }
+        int HeaderAt(Point p)
+        {
+            if (p.Y >= HeaderH) return 0;
+            return BackRect.Contains(p) ? 1 : ForwardRect.Contains(p) ? 2 : UserRect.Contains(p) ? 3 : -1;
+        }
+
+        // ---- the page's key colour, taken from its cover art: a gradient behind the top of the page (drawn once
+        // into a bitmap, then just copied while scrolling) and the solid header
+        const int GradH = 262;
+        string _keyUrl;
+        bool _haveKey;
+        Color _key;
+        Bitmap _grad;
+
+        void DropGradient() { if (_grad != null) { _grad.Dispose(); _grad = null; } }
+
+        // ---- one shared text box for blocks that take typed input (the track list's "Search in playlist").
+        // It only exists on screen while it is being typed in or holds text; otherwise the block just draws its frame.
+        readonly TextBox _input = new TextBox();
+        Block _inputOwner;
+        bool _inputWanted, _inputQuiet;
+        public bool InputFocused { get { return _input.Focused; } }
+        public bool InputWanted(Block b) { return _inputOwner == b && _inputWanted; }
+        public string InputText(Block b) { return _inputOwner == b ? _input.Text : ""; }
+
+        /// <summary>The colour behind a block's input area: the page there (gradient included), lightened a little -
+        /// what a translucent white box would look like. The block fills its frame with it and the text box uses it too.</summary>
+        public Color InputBack(Block b)
+        {
+            Rectangle l = b.InputBounds;
+            int y = b.Top + l.Top + l.Height / 2;
+            Color under = Theme.Main;
+            if (_haveKey && y < GradH)
+            {
+                double t = Math.Max(0, y) / (double)GradH;
+                under = Color.FromArgb((int)(_key.R + (Theme.Main.R - _key.R) * t), (int)(_key.G + (Theme.Main.G - _key.G) * t), (int)(_key.B + (Theme.Main.B - _key.B) * t));
+            }
+            return Color.FromArgb(under.R + (255 - under.R) / 10, under.G + (255 - under.G) / 10, under.B + (255 - under.B) / 10);
+        }
+
+        public void ActivateInput(Block b)
+        {
+            if (_inputOwner != b) { _inputQuiet = true; _input.Text = ""; _inputQuiet = false; }
+            _inputOwner = b; _inputWanted = true;
+            EnsureLayout();
+            SyncInput();
+            _input.Focus();
+            Invalidate();
+        }
+
+        public void ClearInput(Block b)
+        {
+            if (_inputOwner != b) return;
+            _input.Text = "";
+            ActivateInput(b);
+        }
+
+        // keeps the text box where its block is (it scrolls with the page; hidden while under the header or off-screen)
+        void SyncInput()
+        {
+            if (_inputOwner == null || !_inputWanted) { if (_input.Visible) _input.Visible = false; return; }
+            Rectangle l = _inputOwner.InputBounds;
+            int h = _input.PreferredHeight;
+            Rectangle s = new Rectangle(l.Left, _inputOwner.Top - _scroll + l.Top + (l.Height - h) / 2, l.Width, h);
+            bool show = s.Top >= HeaderH && s.Bottom <= ClientSize.Height;
+            Color back = InputBack(_inputOwner);
+            if (_input.BackColor != back) _input.BackColor = back;
+            if (show && _input.Bounds != s) _input.Bounds = s;
+            if (_input.Visible != show) _input.Visible = show;
+        }
+
+        void SetUpInput()
+        {
+            _input.BorderStyle = BorderStyle.None;
+            _input.Font = Theme.Normal;
+            _input.ForeColor = Color.White;
+            _input.BackColor = Theme.Main;
+            _input.Visible = false;
+            _input.TabStop = false;
+            Menus.ForTextBox(_input);
+            _input.TextChanged += delegate
+            {
+                if (_inputQuiet) return;
+                if (_inputOwner != null) _inputOwner.InputChanged(_input.Text, this);
+                Invalidate();
+            };
+            _input.LostFocus += delegate { if (_input.Text.Length == 0 && _inputWanted) { _inputWanted = false; Invalidate(); } };
+            _input.KeyDown += delegate (object s, KeyEventArgs e)
+            {
+                if (e.KeyCode != Keys.Escape) return;
+                if (_input.Text.Length > 0) _input.Text = ""; else Focus();      // Esc: clear, then leave the box
+                e.Handled = true; e.SuppressKeyPress = true;
+            };
+            Controls.Add(_input);
+        }
+
+        void EnsureKey()
+        {
+            if (_haveKey || _keyUrl == null) return;
+            Bitmap bmp = _host.Images.Get(_keyUrl, 16, 16);      // null while loading: the cache repaints us when it arrives
+            if (bmp == null) return;
+            double r = 0, g = 0, b = 0; int n = 0;
+            try
+            {
+                for (int y = 0; y < bmp.Height; y++)
+                    for (int x = 0; x < bmp.Width; x++)
+                    {
+                        Color c = bmp.GetPixel(x, y);
+                        if (c.A < 200) continue;                 // the rounded corners
+                        r += c.R; g += c.G; b += c.B; n++;
+                    }
+            }
+            catch (Exception) { n = 0; }
+            if (n == 0) { _keyUrl = null; return; }
+            r /= n; g /= n; b /= n;
+            double mean = (r + g + b) / 3;                       // a little more saturated than the plain average...
+            r = Math.Max(0, mean + (r - mean) * 1.3); g = Math.Max(0, mean + (g - mean) * 1.3); b = Math.Max(0, mean + (b - mean) * 1.3);
+            double k = 96.0 / Math.Max(1.0, Math.Max(r, Math.Max(g, b)));      // ...and always dark: brightest channel 96
+            _key = Color.FromArgb(Math.Min(255, (int)(r * k)), Math.Min(255, (int)(g * k)), Math.Min(255, (int)(b * k)));
+            _haveKey = true;
+            DropGradient();
+        }
+
+        void PaintGradient(Graphics g)
+        {
+            if (!_haveKey || _scroll >= GradH) return;
+            int w = Math.Max(64, (ClientSize.Width + 63) / 64 * 64);      // 64 px steps: resizing doesn't rebuild it every pixel
+            if (_grad == null || _grad.Width != w)
+            {
+                DropGradient();
+                _grad = new Bitmap(w, GradH, System.Drawing.Imaging.PixelFormat.Format32bppRgb);
+                using (Graphics bg = Graphics.FromImage(_grad))
+                using (LinearGradientBrush lb = new LinearGradientBrush(new Rectangle(0, -1, w, GradH + 2), _key, Theme.Main, LinearGradientMode.Vertical))
+                    bg.FillRectangle(lb, 0, 0, w, GradH);
+            }
+            g.DrawImage(_grad, 0, -_scroll, _grad.Width, _grad.Height);
+        }
+
+        void PaintHeader(Graphics g)
+        {
+            // fades in with the scroll: clear at the top, solid once the header's artwork and buttons reach its bottom edge
+            int alpha = _scroll <= 0 ? 0 : _scroll >= _solidAt ? 255 : (int)(255L * _scroll / _solidAt);
+            if (alpha > 0)
+                using (SolidBrush b = new SolidBrush(Color.FromArgb(alpha, _haveKey ? _key : Color.FromArgb(32, 32, 32)))) g.FillRectangle(b, 0, 0, ClientSize.Width, HeaderH);
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            RoundButton(g, BackRect, _hdrHot == 1 && CanBack);
+            RoundButton(g, ForwardRect, _hdrHot == 2 && CanForward);
+            RoundButton(g, UserRect, _hdrHot == 3);
+            Chevron(g, BackRect, true, CanBack, _hdrHot == 1);
+            Chevron(g, ForwardRect, false, CanForward, _hdrHot == 2);
+            Rectangle u = UserRect;
+            int cx = u.Left + u.Width / 2, cy = u.Top + u.Height / 2;
+            using (Pen p = new Pen(_hdrHot == 3 ? Color.White : Color.FromArgb(200, 200, 200), 1.6f))
+            {
+                g.DrawEllipse(p, cx - 4, cy - 8, 8, 8);                    // head
+                g.DrawArc(p, cx - 7, cy + 2, 14, 12, 180, 180);            // shoulders
+            }
+            g.SmoothingMode = SmoothingMode.None;
+        }
+
+        static void RoundButton(Graphics g, Rectangle r, bool hot)
+        {
+            using (SolidBrush b = new SolidBrush(Color.FromArgb(hot ? 210 : 150, 0, 0, 0))) g.FillEllipse(b, r);
+        }
+
+        static void Chevron(Graphics g, Rectangle r, bool left, bool enabled, bool hot)
+        {
+            Color c = !enabled ? Color.FromArgb(95, 95, 95) : hot ? Color.White : Color.FromArgb(200, 200, 200);
+            int cx = r.Left + r.Width / 2, cy = r.Top + r.Height / 2, d = left ? 1 : -1;
+            using (Pen p = new Pen(c, 1.8f))
+            {
+                p.StartCap = LineCap.Round; p.EndCap = LineCap.Round;
+                g.DrawLine(p, cx + 2 * d, cy - 6, cx - 3 * d, cy);
+                g.DrawLine(p, cx - 3 * d, cy, cx + 2 * d, cy + 6);
+            }
+        }
 
         public PageView(IPageHost host)
         {
@@ -51,6 +253,12 @@ namespace Spotipaq
                      ControlStyles.ResizeRedraw | ControlStyles.Selectable, true);
             BackColor = Theme.Main;
             ForeColor = Theme.Text;
+            _bar = new SlimScroll(this, delegate { return _scroll; }, delegate { return MaxScroll; },
+                delegate (int v) { _scroll = v; ClampScroll(); }, 80,
+                Color.Transparent, Color.FromArgb(90, 90, 90), Color.FromArgb(150, 150, 150));      // no track: the page shows through
+            SetUpInput();
+            _bar.TopInset = HeaderH;                   // the up arrow starts just under the header...
+            _bar.BottomInset = Theme.CardRadius;       // ...and the down arrow ends where the bottom corner starts to curve
         }
 
         public IPageHost Host { get { return _host; } }
@@ -59,6 +267,12 @@ namespace Spotipaq
         {
             _blocks.Clear();
             _blocks.AddRange(blocks);
+            string url = null;
+            foreach (Block b in _blocks) { url = b.KeyImageUrl; if (!String.IsNullOrEmpty(url)) break; url = null; }
+            if (url != _keyUrl) { _keyUrl = url; _haveKey = false; DropGradient(); }
+            _inputOwner = null; _inputWanted = false;                   // a new page: the search box starts empty and closed
+            _inputQuiet = true; _input.Text = ""; _inputQuiet = false;
+            if (_input.Visible) _input.Visible = false;
             _scroll = 0;
             _hot = null;
             _layoutWidth = -1;
@@ -72,9 +286,12 @@ namespace Spotipaq
             int w = ClientSize.Width - BarW;
             if (w == _layoutWidth) return;
             _layoutWidth = w;
-            int y = 0;
+            int y = HeaderH;                   // the page starts below the header overlay
             foreach (Block b in _blocks) { b.Top = y; b.Height = b.Layout(w); y += b.Height; }
             _contentHeight = y + 24;
+            _solidAt = 120;
+            foreach (Block b in _blocks)
+                if (b.HeaderContentBottom > 0) { _solidAt = Math.Max(1, b.Top + b.HeaderContentBottom - HeaderH); break; }
             ClampScroll();
         }
 
@@ -88,6 +305,9 @@ namespace Spotipaq
             EnsureLayout();
             Graphics g = e.Graphics;
             g.Clear(Theme.Main);
+            EnsureKey();
+            SyncInput();
+            PaintGradient(g);
             Rectangle clip = e.ClipRectangle;
             foreach (Block b in _blocks)
             {
@@ -95,21 +315,9 @@ namespace Spotipaq
                 if (r.Bottom < clip.Top || r.Top > clip.Bottom) continue;
                 b.Paint(g, r, this);
             }
-            // thin scrollbar (Spotify-style), only when needed
-            if (MaxScroll > 0)
-            {
-                Rectangle thumb = Thumb();
-                using (SolidBrush track = new SolidBrush(Color.FromArgb(30, 30, 30))) g.FillRectangle(track, ClientSize.Width - BarW, 0, BarW, ClientSize.Height);
-                using (SolidBrush tb = new SolidBrush(_dragThumb ? Color.FromArgb(150, 150, 150) : Color.FromArgb(90, 90, 90))) g.FillRectangle(tb, thumb);
-            }
-        }
-
-        Rectangle Thumb()
-        {
-            int h = ClientSize.Height;
-            int th = Math.Max(30, (int)((long)h * h / Math.Max(1, _contentHeight)));
-            int ty = MaxScroll == 0 ? 0 : (int)((long)(h - th) * _scroll / MaxScroll);
-            return new Rectangle(ClientSize.Width - BarW + 1, ty, BarW - 2, th);
+            PaintHeader(g);
+            _bar.Paint(g);          // thin scrollbar (Spotify-style), only when needed
+            Theme.CardCorners(g, ClientRectangle, Theme.CardRadius, Theme.Window);      // the page is a rounded card
         }
 
         Block BlockAt(int contentY, out Point local, int x)
@@ -125,19 +333,23 @@ namespace Spotipaq
         protected override void OnMouseDown(MouseEventArgs e)
         {
             Focus();
-            if (MaxScroll > 0 && e.X >= ClientSize.Width - BarW)
-            {
-                Rectangle t = Thumb();
-                if (t.Contains(e.Location)) { _dragThumb = true; _dragOffset = e.Y - t.Top; Capture = true; }
-                else ScrollBy(e.Y < t.Top ? -ClientSize.Height : ClientSize.Height);
-                return;
-            }
+            if (_bar.MouseDown(e)) return;
+            if (e.Y < HeaderH) return;         // header buttons act on mouse up
             base.OnMouseDown(e);
         }
 
         protected override void OnMouseUp(MouseEventArgs e)
         {
-            if (_dragThumb) { _dragThumb = false; Capture = false; Invalidate(); return; }
+            if (_bar.MouseUp(e)) return;
+            int hh = HeaderAt(e.Location);
+            if (hh != 0)
+            {
+                if (e.Button != MouseButtons.Left) return;
+                if (hh == 1 && CanBack && Back != null) Back(this, EventArgs.Empty);
+                else if (hh == 2 && CanForward && Forward != null) Forward(this, EventArgs.Empty);
+                else if (hh == 3 && UserMenu != null) UserMenu.Show(this, new Point(UserRect.Right, UserRect.Bottom + 4), ToolStripDropDownDirection.BelowLeft);
+                return;
+            }
             Point local;
             Block b = BlockAt(e.Y + _scroll, out local, e.X);
             if (b != null) b.Click(local, e.Button, this);
@@ -146,6 +358,7 @@ namespace Spotipaq
 
         protected override void OnMouseDoubleClick(MouseEventArgs e)
         {
+            if (e.Y < HeaderH) return;
             Point local;
             Block b = BlockAt(e.Y + _scroll, out local, e.X);
             if (b != null && e.Button == MouseButtons.Left) b.DoubleClick(local, this);
@@ -154,12 +367,21 @@ namespace Spotipaq
 
         protected override void OnMouseMove(MouseEventArgs e)
         {
-            if (_dragThumb)
+            if (_bar.MouseMove(e))
             {
-                int h = ClientSize.Height, th = Thumb().Height;
-                _scroll = (int)((long)(e.Y - _dragOffset) * MaxScroll / Math.Max(1, h - th));
-                ClampScroll();
-                Invalidate();
+                if (_hot != null && _hot.MouseLeave()) Invalidate();
+                _hot = null;
+                SetHeaderHot(0);
+                Cursor = Cursors.Default;
+                return;
+            }
+            int hh = HeaderAt(e.Location);
+            SetHeaderHot(hh);
+            if (hh != 0)
+            {
+                if (_hot != null && _hot.MouseLeave()) Invalidate();
+                _hot = null;
+                Cursor = hh == 3 || (hh == 1 && CanBack) || (hh == 2 && CanForward) ? Cursors.Hand : Cursors.Default;
                 return;
             }
             Point local;
@@ -168,7 +390,7 @@ namespace Spotipaq
             if (_hot != null && _hot != b) repaint |= _hot.MouseLeave();
             _hot = b;
             if (b != null) repaint |= b.MouseMove(local, this);
-            Cursor = b != null && b.IsLink(local) ? Cursors.Hand : Cursors.Default;
+            Cursor = b != null ? b.CursorAt(local, this) : Cursors.Default;
             if (repaint) Invalidate();
             base.OnMouseMove(e);
         }
@@ -177,7 +399,16 @@ namespace Spotipaq
         {
             if (_hot != null && _hot.MouseLeave()) Invalidate();
             _hot = null;
+            _bar.MouseLeave();
+            SetHeaderHot(0);
             base.OnMouseLeave(e);
+        }
+
+        void SetHeaderHot(int h)
+        {
+            if (h == _hdrHot) return;
+            _hdrHot = h;
+            Invalidate(new Rectangle(0, 0, ClientSize.Width, HeaderH));
         }
 
         protected override bool IsInputKey(Keys keyData)
@@ -202,59 +433,155 @@ namespace Spotipaq
     // Blocks
     // =====================================================================================================
 
+    public delegate bool StateGetter();
+
     public sealed class PageButton
     {
         public string Text; public bool Filled; public int Width; public EventHandler Action;
+        /// <summary>null = a pill with the text; "play" = a round green play button; otherwise the name of an icon
+        /// (see Glyphs) shown inside a ring. Round buttons are as tall as they are wide.</summary>
+        public string Icon;
+        /// <summary>Set for a toggle: the icon is drawn bare (no ring), green while this returns true.</summary>
+        public StateGetter On;
         public PageButton(string text, bool filled, int width, EventHandler action) { Text = text; Filled = filled; Width = width; Action = action; }
+        public PageButton(string text, bool filled, int width, string icon, EventHandler action) : this(text, filled, width, action) { Icon = icon; }
+        public int Height { get { return Icon != null ? Width : 30; } }
+
+        public void Paint(Graphics g, Rectangle r, bool hot)
+        {
+            if (Icon == null) { Theme.PillButton(g, r, Text, Filled, hot); return; }
+            SmoothingMode old = g.SmoothingMode;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            if (Icon == "play")
+            {
+                Rectangle d = r;
+                if (hot) d.Inflate(1, 1);                          // grows a pixel under the pointer
+                using (SolidBrush b = new SolidBrush(hot ? Theme.AccentHover : Theme.Accent)) g.FillEllipse(b, d);
+                int cx = r.Left + r.Width / 2, cy = r.Top + r.Height / 2, k = r.Width / 5;
+                using (SolidBrush b = new SolidBrush(Color.Black))
+                    g.FillPolygon(b, new Point[] { new Point(cx - k / 2 - 1, cy - k), new Point(cx + k, cy), new Point(cx - k / 2 - 1, cy + k) });
+            }
+            else if (On != null)
+            {
+                Color c = On() ? (hot ? Theme.AccentHover : Theme.Accent) : hot ? Color.White : Color.FromArgb(179, 179, 179);
+                if (!Glyphs.Draw(g, Icon, r, c))
+                    Theme.Draw(g, Text.Length > 0 ? Text.Substring(0, 1) : "", Theme.NormalBold, r, c, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
+            }
+            else
+            {
+                Color c = hot ? Color.White : Color.FromArgb(179, 179, 179);
+                using (Pen ring = new Pen(c, 1.5f)) g.DrawEllipse(ring, r.Left + 1, r.Top + 1, r.Width - 3, r.Height - 3);
+                if (!Glyphs.Draw(g, Icon, r, c))
+                    Theme.Draw(g, Text.Length > 0 ? Text.Substring(0, 1) : "", Theme.SmallBold, r, c, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
+            }
+            g.SmoothingMode = old;
+        }
+
+        /// <summary>Height of a row of buttons: the tallest one.</summary>
+        public static int RowHeight(List<PageButton> buttons) { int h = 30; foreach (PageButton b in buttons) h = Math.Max(h, b.Height); return h; }
     }
 
     /// <summary>Album / playlist header: artwork, small type label, huge title, subtitle, buttons.</summary>
     public sealed class HeaderBlock : Block
     {
-        readonly string _label, _title, _imageUrl;
-        readonly string _byName; readonly NavTarget _byTarget; readonly string _subtitle;
+        readonly string _label, _title, _description, _imageUrl;
+        readonly string _byName; readonly NavTarget _byTarget;
+        readonly string[] _bright; readonly string _dim;
         readonly List<PageButton> _buttons;
         int _hotButton = -1; bool _hotBy;
         const int Art = 160, Pad = 30, PadY = 22, TextX = Pad + Art + 24;
+        const int MetaX = TextX + 3;                    // lines up with the padded text above it
+        const int DotGap = 6, DotSize = 4;              // the dot between the parts of the bottom line
+        static readonly Color Bright = Color.White;
 
-        public HeaderBlock(string label, string title, string byName, NavTarget byTarget, string subtitle, string imageUrl, List<PageButton> buttons)
-        { _label = label; _title = title; _byName = byName; _byTarget = byTarget; _subtitle = subtitle; _imageUrl = imageUrl; _buttons = buttons; }
+        /// <summary>label (small caps), title, an optional description under it, then one line: byName (a link when
+        /// byTarget is set) and the "bright" parts in white with dots between them, followed by "dim" in grey.</summary>
+        public HeaderBlock(string label, string title, string description, string byName, NavTarget byTarget,
+            string[] bright, string dim, string imageUrl, List<PageButton> buttons)
+        {
+            _label = label; _title = title; _description = description; _byName = byName; _byTarget = byTarget;
+            _bright = bright ?? new string[0]; _dim = dim; _imageUrl = imageUrl; _buttons = buttons;
+        }
 
         public override int Layout(int width) { return Art + PadY + 10; }
+        public override string KeyImageUrl { get { return _imageUrl; } }
+        public override int HeaderContentBottom { get { return PadY + Art; } }       // the cover's and the buttons' bottom edge
+
+        bool HasDescription { get { return !String.IsNullOrEmpty(_description); } }
+        int MetaY { get { return PadY + (HasDescription ? 86 : 66); } }
+
+        // Exact text widths, so the differently coloured parts of the bottom line sit flush against each other.
+        // Measuring the text twice over and once, and taking the difference, leaves only what the text itself
+        // advances by: whatever padding the measurement adds is in both and cancels out.
+        const TextFormatFlags Plain = TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine;
+        static int TextW(string s, Font f)
+        {
+            if (String.IsNullOrEmpty(s)) return 0;
+            if (Theme.IsRich(s)) return Theme.Measure(s, f).Width - 4;          // symbols / emoji: laid out by Theme, 2 px either side
+            Size big = new Size(100000, 100);
+            return TextRenderer.MeasureText(s + s, f, big, Plain).Width - TextRenderer.MeasureText(s, f, big, Plain).Width;
+        }
+        /// <summary>Draws one part of the bottom line at x and returns where the next one starts.</summary>
+        static int Part(Graphics g, string s, Font f, int x, int y, int right, Color c)
+        {
+            if (String.IsNullOrEmpty(s) || x >= right) return x;
+            int w = TextW(s, f);
+            int dx = Theme.IsRich(s) ? 2 : 0;                                   // Theme's own layout starts 2 px in
+            Theme.Draw(g, s, f, new Rectangle(x - dx, y, Math.Min(w + 16, right - x) + dx, 20), c, Theme.LeftEllipsis | TextFormatFlags.NoPadding);
+            return x + w;
+        }
 
         Rectangle ButtonRect(int i)
         {
             int x = TextX;
             for (int j = 0; j < i; j++) x += _buttons[j].Width + 12;
-            return new Rectangle(x, PadY + Art - 30, _buttons[i].Width, 30);
+            int rowH = PageButton.RowHeight(_buttons), h = _buttons[i].Height;      // bottom of the row lines up with the cover's
+            return new Rectangle(x, PadY + Art - rowH + (rowH - h) / 2, _buttons[i].Width, h);
         }
-        Rectangle ByRect(Graphics g)
+        Rectangle ByRect()
         {
-            return new Rectangle(TextX + 18, PadY + 66, Theme.Measure(_byName ?? "", Theme.NormalBold).Width, 20);
+            return new Rectangle(MetaX, MetaY, TextW(_byName, Theme.NormalBold), 20);
         }
 
         public override void Paint(Graphics g, Rectangle r, PageView view)
         {
             Rectangle art = new Rectangle(r.Left + Pad, r.Top + PadY, Art, Art);
             Theme.Art(g, view.Host.Images.Get(_imageUrl, Art, Art), art, false);
+            // (the page's key colour comes from this same picture, see KeyImageUrl)
             int x = r.Left + TextX, w = r.Width - TextX - Pad;
             Theme.Text1(g, _label, Theme.Label, new Rectangle(x, r.Top + PadY + 2, w, 16), Theme.SubText);
             Theme.Text1(g, _title, Theme.Huge, new Rectangle(x - 2, r.Top + PadY + 20, w, 40), Theme.Text);
-            int y = r.Top + PadY + 66;
+            if (HasDescription)
+                Theme.Text1(g, _description, Theme.Normal, new Rectangle(x, r.Top + PadY + 64, w, 20), Theme.SubText);
+
+            // creator • 12 songs, 48 min
+            int y = r.Top + MetaY, cx = r.Left + MetaX, right = x + w;
+            bool first = true;
             if (!String.IsNullOrEmpty(_byName))
             {
-                Theme.Text1(g, "By", Theme.Normal, new Rectangle(x, y, 20, 20), Theme.SubText);
-                int bw = Theme.Measure(_byName, Theme.NormalBold).Width;
-                Color c = _hotBy ? Theme.Text : Color.FromArgb(230, 230, 230);
-                Theme.Text1(g, _byName, Theme.NormalBold, new Rectangle(x + 18, y, bw + 4, 20), c);
-                if (_hotBy) using (Pen u = new Pen(c)) g.DrawLine(u, x + 21, y + 16, x + 18 + bw - 4, y + 16);
-                Theme.Text1(g, " • " + _subtitle, Theme.Normal, new Rectangle(x + 18 + bw - 4, y, w - bw, 20), Theme.SubText);
+                int end = Part(g, _byName, Theme.NormalBold, cx, y, right, Bright);
+                if (_hotBy) using (Pen u = new Pen(Bright)) g.DrawLine(u, cx, y + 17, Math.Min(end, right) - 1, y + 17);
+                cx = end; first = false;
             }
-            else Theme.Text1(g, _subtitle, Theme.Normal, new Rectangle(x, y, w, 20), Theme.SubText);
+            foreach (string part in _bright)
+            {
+                if (String.IsNullOrEmpty(part)) continue;
+                if (!first && cx + DotGap * 2 + DotSize < right)
+                {
+                    SmoothingMode sm = g.SmoothingMode; g.SmoothingMode = SmoothingMode.AntiAlias;
+                    using (SolidBrush dot = new SolidBrush(Bright)) g.FillEllipse(dot, cx + DotGap, y + 8, DotSize, DotSize);
+                    g.SmoothingMode = sm;
+                    cx += DotGap * 2 + DotSize;
+                }
+                cx = Part(g, part, Theme.Normal, cx, y, right, Bright);
+                first = false;
+            }
+            Part(g, _dim, Theme.Normal, cx, y, right, Theme.SubText);
+
             for (int i = 0; i < _buttons.Count; i++)
             {
                 Rectangle b = ButtonRect(i); b.Offset(r.Left, r.Top);
-                Theme.PillButton(g, b, _buttons[i].Text, _buttons[i].Filled, i == _hotButton);
+                _buttons[i].Paint(g, b, i == _hotButton);
             }
         }
 
@@ -262,7 +589,7 @@ namespace Spotipaq
         {
             int hot = -1;
             for (int i = 0; i < _buttons.Count; i++) if (ButtonRect(i).Contains(p)) hot = i;
-            bool by = _byTarget != null && new Rectangle(TextX + 18, PadY + 66, Theme.Measure(_byName ?? "", Theme.NormalBold).Width, 20).Contains(p);
+            bool by = _byTarget != null && !String.IsNullOrEmpty(_byName) && ByRect().Contains(p);
             bool changed = hot != _hotButton || by != _hotBy;
             _hotButton = hot; _hotBy = by;
             return changed;
@@ -284,11 +611,14 @@ namespace Spotipaq
         const int H = 280;
         public ArtistHeaderBlock(Artist artist, List<PageButton> buttons) { _artist = artist; _buttons = buttons; }
         public override int Layout(int width) { return H; }
+        public override string KeyImageUrl { get { return _artist.ImageUrl; } }
+        public override int HeaderContentBottom { get { return 200; } }               // the photo's and the buttons' bottom edge
         Rectangle ButtonRect(int i)
         {
             int x = 180;
             for (int j = 0; j < i; j++) x += _buttons[j].Width + 12;
-            return new Rectangle(x, 170, _buttons[i].Width, 30);
+            int h = _buttons[i].Height;
+            return new Rectangle(x, 185 - h / 2, _buttons[i].Width, h);
         }
         public override void Paint(Graphics g, Rectangle r, PageView view)
         {
@@ -298,7 +628,7 @@ namespace Spotipaq
             if (banner != null) g.DrawImage(banner, r.Left, r.Top, bw, bh);
             else using (SolidBrush b = new SolidBrush(Color.FromArgb(48, 48, 48))) g.FillRectangle(b, r.Left, r.Top, bw, bh);
             using (LinearGradientBrush fade = new LinearGradientBrush(new Rectangle(r.Left, r.Top, bw, bh + 1),
-                Color.FromArgb(60, 0, 0, 0), Color.FromArgb(235, 24, 24, 24), LinearGradientMode.Vertical))
+                Color.FromArgb(60, 0, 0, 0), Color.FromArgb(235, Theme.Main), LinearGradientMode.Vertical))
                 g.FillRectangle(fade, r.Left, r.Top, bw, bh);
             Rectangle avatar = new Rectangle(r.Left + 30, r.Top + 70, 130, 130);
             Theme.Art(g, view.Host.Images.Get(_artist.ImageUrl, 130, 130), avatar, true);
@@ -307,7 +637,7 @@ namespace Spotipaq
             for (int i = 0; i < _buttons.Count; i++)
             {
                 Rectangle b = ButtonRect(i); b.Offset(r.Left, r.Top);
-                Theme.PillButton(g, b, _buttons[i].Text, _buttons[i].Filled, i == _hot);
+                _buttons[i].Paint(g, b, i == _hot);
             }
             Theme.Text1(g, _artist.Followers.ToString("n0") + " followers", Theme.Small,
                 new Rectangle(r.Left + 180, r.Top + 210, 300, 18), Theme.SubText);
@@ -354,9 +684,11 @@ namespace Spotipaq
         }
     }
 
-    [Flags] public enum TrackColumns { None = 0, Number = 1, Artist = 2, Album = 4, Popularity = 8, PlayCount = 16, Art = 32 }
+    [Flags] public enum TrackColumns { None = 0, Number = 1, Artist = 2, Album = 4, Popularity = 8, PlayCount = 16, Art = 32, Search = 64 }
 
-    /// <summary>The track table. Only visible rows are painted; double-click plays from that row.</summary>
+    /// <summary>The track table. Only visible rows are painted; double-click plays from that row.
+    /// With the Artist column the title cell has two lines (title, artist under it) and rows are taller.
+    /// With Search there is a "Search in playlist" box above the column headers that filters the rows as you type.</summary>
     public sealed class TrackListBlock : Block
     {
         readonly List<Track> _orig; List<Track> _tracks; readonly TrackColumns _cols; readonly bool _header;
@@ -364,48 +696,107 @@ namespace Spotipaq
         bool _sortDesc;
         int _hotRow = -1, _selected = -1, _width;
         string _hotLink;                      // "artist" / "album" while over a link
-        const int RowH = 36, HeadH = 32, Pad = 30;
+        string _filter = "";                  // what was typed into the search box
+        bool _hotSearch;
+        const int HeadH = 32, Pad = 30, ToolsH = 46;
+        readonly int _rowH, _artSize;
+        static readonly Color Soft = Color.FromArgb(179, 179, 179);
 
-        public TrackListBlock(List<Track> tracks, TrackColumns cols, bool header) { _orig = tracks; _tracks = tracks; _cols = cols; _header = header; }
+        public TrackListBlock(List<Track> tracks, TrackColumns cols, bool header)
+        {
+            _orig = tracks; _tracks = tracks; _cols = cols; _header = header;
+            _rowH = TwoLine ? 48 : 36;
+            _artSize = TwoLine ? 36 : 28;
+        }
 
-        int HeadHeight { get { return _header ? HeadH : 0; } }
-        public override int Layout(int width) { _width = width; return HeadHeight + _tracks.Count * RowH + 8; }
+        bool Has(TrackColumns c) { return (_cols & c) != 0; }
+        bool TwoLine { get { return Has(TrackColumns.Artist); } }
+        bool Searchable { get { return Has(TrackColumns.Search); } }
+        int Tools { get { return Searchable ? ToolsH : 0; } }
+        int HeadHeight { get { return Tools + (_header ? HeadH : 0); } }
+        public override int Layout(int width)
+        {
+            _width = width;
+            return HeadHeight + Math.Max(_tracks.Count, _filter.Length > 0 ? 1 : 0) * _rowH + 8;
+        }
 
         // column x positions for the current width
-        void Columns(int width, out int num, out int plus, out int title, out int artist, out int album, out int extra, out int dur)
+        void Columns(int width, out int num, out int art, out int title, out int album, out int extra, out int dur)
         {
-            num = Pad; plus = Pad + ((_cols & TrackColumns.Number) != 0 ? 34 : 0);
-            title = plus + 30 + ((_cols & TrackColumns.Art) != 0 ? 40 : 0);
-            dur = width - Pad - ((_cols & TrackColumns.Popularity) != 0 ? 110 : (_cols & TrackColumns.PlayCount) != 0 ? 130 : 60);
+            num = Pad;
+            art = Pad + (Has(TrackColumns.Number) ? 38 : 0);
+            title = art + (Has(TrackColumns.Art) ? _artSize + 12 : 0);
+            dur = width - Pad - (Has(TrackColumns.Popularity) ? 110 : Has(TrackColumns.PlayCount) ? 130 : 60);
             extra = dur + 56;
             int free = dur - 20 - title;
-            int n = 1 + ((_cols & TrackColumns.Artist) != 0 ? 1 : 0) + ((_cols & TrackColumns.Album) != 0 ? 1 : 0);
-            int each = free / n;
-            artist = (_cols & TrackColumns.Artist) != 0 ? title + each : -1;
-            album = (_cols & TrackColumns.Album) != 0 ? (artist > 0 ? artist + each : title + each) : -1;
+            album = Has(TrackColumns.Album) ? title + free / 2 : -1;
+        }
+
+        // ---- search box (block coordinates)
+        Rectangle SearchRect { get { int w = Math.Max(120, Math.Min(204, _width - 2 * Pad)); return new Rectangle(_width - Pad - w, 7, w, 32); } }
+        public override Rectangle InputBounds { get { Rectangle s = SearchRect; return new Rectangle(s.Left + 32, s.Top, s.Width - 32 - 30, s.Height); } }
+        public override void InputChanged(string text, PageView view)
+        {
+            _filter = (text ?? "").Trim();
+            Rebuild();
+            _hotRow = -1;
+            view.Relayout();
+        }
+
+        void PaintSearch(Graphics g, Rectangle r, PageView view)
+        {
+            Rectangle s = SearchRect; s.Offset(r.Left, r.Top);
+            Theme.FillRounded(g, s, 4, view.InputBack(this));
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            using (Pen lens = new Pen(Soft, 1.6f))
+            {
+                g.DrawEllipse(lens, s.Left + 10, s.Top + 10, 9, 9);
+                g.DrawLine(lens, s.Left + 18, s.Top + 18, s.Left + 22, s.Top + 22);
+            }
+            if (view.InputText(this).Length > 0)
+                using (Pen x = new Pen(_hotSearch ? Color.White : Soft, 1.6f))
+                {
+                    int cx = s.Right - 16, cy = s.Top + s.Height / 2;
+                    g.DrawLine(x, cx - 4, cy - 4, cx + 4, cy + 4);
+                    g.DrawLine(x, cx - 4, cy + 4, cx + 4, cy - 4);
+                }
+            g.SmoothingMode = SmoothingMode.None;
+            if (!view.InputWanted(this))
+                Theme.Text1(g, "Search in playlist", Theme.Normal, new Rectangle(s.Left + 32, s.Top, s.Width - 40, s.Height), Soft);
         }
 
         public override void Paint(Graphics g, Rectangle r, PageView view)
         {
-            int num, plus, title, artist, album, extra, dur;
-            Columns(r.Width, out num, out plus, out title, out artist, out album, out extra, out dur);
+            int num, art, title, album, extra, dur;
+            Columns(r.Width, out num, out art, out title, out album, out extra, out dur);
             Rectangle clip = Rectangle.Round(g.ClipBounds);
+            if (Searchable) PaintSearch(g, r, view);
             if (_header)
             {
-                int y = r.Top + 8;
-                if ((_cols & TrackColumns.Number) != 0) HeadLabel(g, "num", "#", r.Left + num + 4, y);
-                HeadLabel(g, "song", "SONG", r.Left + title, y);
-                if (artist > 0) HeadLabel(g, "artist", "ARTIST", r.Left + artist, y);
-                if (album > 0) HeadLabel(g, "album", "ALBUM", r.Left + album, y);
-                HeadLabel(g, "time", "TIME", r.Left + dur, y);
-                if ((_cols & TrackColumns.Popularity) != 0) HeadLabel(g, "pop", "POPULARITY", r.Left + extra, y);
-                using (Pen p = new Pen(Theme.Line)) g.DrawLine(p, r.Left + Pad, r.Top + HeadH - 2, r.Right - Pad, r.Top + HeadH - 2);
+                int y = r.Top + Tools + 8;
+                if (Has(TrackColumns.Number)) HeadLabel(g, "num", "#", r.Left + num + 10, y, false);
+                bool byArtist = _sortKey == "artist";
+                HeadLabel(g, "song", byArtist ? "Artist" : "Title", r.Left + (Has(TrackColumns.Art) ? art : title), y, _sortKey == "song" || byArtist);
+                if (album > 0) HeadLabel(g, "album", "Album", r.Left + album, y, _sortKey == "album");
+                // duration: a clock
+                Color cc = _sortKey == "time" || _hotHead == "time" ? Theme.Text : Soft;
+                if (Glyphs.Draw(g, "ic_clock", new Rectangle(r.Left + dur + 6, y, 16, 18), cc))
+                { if (_sortKey == "time") SortArrow(g, r.Left + dur + 26, y + 8); }
+                else HeadLabel(g, "time", "Time", r.Left + dur, y, _sortKey == "time");
+                if (Has(TrackColumns.Popularity)) HeadLabel(g, "pop", "Popularity", r.Left + extra, y, _sortKey == "pop");
+                using (Pen p = new Pen(Theme.Line)) g.DrawLine(p, r.Left + Pad, r.Top + HeadHeight - 2, r.Right - Pad, r.Top + HeadHeight - 2);
+            }
+            if (_tracks.Count == 0 && _filter.Length > 0)
+            {
+                Theme.Text1(g, "No songs match \"" + _filter + "\"", Theme.Normal, new Rectangle(r.Left + Pad, r.Top + HeadHeight, r.Width - 2 * Pad, _rowH), Theme.SubText);
+                return;
             }
             Track playing = view.Host.PlayingTrack;
-            int first = Math.Max(0, (clip.Top - r.Top - HeadHeight) / RowH);
+            int first = Math.Max(0, (clip.Top - r.Top - HeadHeight) / _rowH);
+            int titleW = (album > 0 ? album : dur) - title - 12;
             for (int i = first; i < _tracks.Count; i++)
             {
-                Rectangle row = new Rectangle(r.Left + Pad - 10, r.Top + HeadHeight + i * RowH, r.Width - 2 * Pad + 20, RowH);
+                Rectangle row = new Rectangle(r.Left + Pad - 10, r.Top + HeadHeight + i * _rowH, r.Width - 2 * Pad + 20, _rowH);
                 if (row.Top > clip.Bottom) break;
                 Track t = _tracks[i];
                 bool isPlaying = playing != null && playing.Id == t.Id;
@@ -413,49 +804,45 @@ namespace Spotipaq
                     using (SolidBrush b = new SolidBrush(i == _selected ? Theme.RowSelected : Theme.RowHover)) g.FillRectangle(b, row);
                 Color main = isPlaying ? Theme.Accent : Theme.Text, sub = isPlaying ? Theme.Accent : Theme.SubText;
                 int cy = row.Top;
-                if ((_cols & TrackColumns.Number) != 0)
+                if (Has(TrackColumns.Number))
                 {
-                    Rectangle nr = new Rectangle(r.Left + num, cy, 30, RowH);
+                    Rectangle nr = new Rectangle(r.Left + num, cy, 30, _rowH);
                     if (i == _hotRow || isPlaying) DrawPlayGlyph(g, nr, isPlaying && view.Host.IsPlaying, isPlaying);
-                    else Theme.Draw(g, (t.Number > 0 && (_cols & TrackColumns.Art) == 0 ? t.Number : i + 1).ToString(), Theme.Normal, nr, Theme.SubText,
+                    else Theme.Draw(g, (t.Number > 0 && !Has(TrackColumns.Art) ? t.Number : i + 1).ToString(), Theme.Normal, nr, Theme.SubText,
                         TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
                 }
-                // "+" save glyph
-                using (Pen p = new Pen(Theme.SubText, 1.5f))
-                {
-                    int px = r.Left + plus + 10, py = cy + RowH / 2;
-                    g.DrawLine(p, px - 6, py, px + 6, py); g.DrawLine(p, px, py - 6, px, py + 6);
-                }
-                if ((_cols & TrackColumns.Art) != 0)
-                    Theme.Art(g, view.Host.Images.Get(t.AlbumImageUrl, 28, 28), new Rectangle(r.Left + plus + 32, cy + 4, 28, 28), false);
-                int titleW = (artist > 0 ? artist : album > 0 ? album : dur) - title - 12;
-                Theme.Text1(g, t.Name, Theme.Normal, new Rectangle(r.Left + title, cy, titleW - (t.Explicit ? 66 : 0), RowH), main);
+                if (Has(TrackColumns.Art))
+                    Theme.Art(g, view.Host.Images.Get(t.AlbumImageUrl, _artSize, _artSize), new Rectangle(r.Left + art, cy + (_rowH - _artSize) / 2, _artSize, _artSize), false);
+                // title (and, on two-line rows, the artist under it)
+                Rectangle line1 = TwoLine ? new Rectangle(r.Left + title, cy + 6, titleW, 18) : new Rectangle(r.Left + title, cy, titleW, _rowH);
+                Theme.Text1(g, t.Name, Theme.Normal, new Rectangle(line1.Left, line1.Top, line1.Width - (t.Explicit ? 66 : 0), line1.Height), main);
                 if (t.Explicit)
                 {
-                    Rectangle ex = new Rectangle(r.Left + title + Math.Min(titleW - 60, Theme.Measure(t.Name, Theme.Normal).Width + 8), cy + 11, 54, 14);
+                    Rectangle ex = new Rectangle(line1.Left + Math.Min(titleW - 60, Theme.Measure(t.Name, Theme.Normal).Width + 8), line1.Top + (line1.Height - 14) / 2, 54, 14);
                     using (Pen p = new Pen(Theme.DimText)) g.DrawRectangle(p, ex);
                     Theme.Draw(g, "EXPLICIT", Theme.Label, ex, Theme.DimText, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
                 }
-                if (artist > 0) Link(g, t.ArtistName, new Rectangle(r.Left + artist, cy, (album > 0 ? album : dur) - artist - 12, RowH), sub, i == _hotRow && _hotLink == "artist");
-                if (album > 0) Link(g, t.AlbumName, new Rectangle(r.Left + album, cy, dur - album - 12, RowH), sub, i == _hotRow && _hotLink == "album");
-                Theme.Text1(g, Theme.Time(t.DurationMs), Theme.Normal, new Rectangle(r.Left + dur, cy, 50, RowH), sub);
-                if ((_cols & TrackColumns.Popularity) != 0) PopularityBars(g, r.Left + extra, cy + RowH / 2 - 5, t.Popularity);
-                if ((_cols & TrackColumns.PlayCount) != 0)
-                    Theme.Draw(g, t.PlayCount.ToString("n0"), Theme.Normal, new Rectangle(r.Left + extra, cy, 110, RowH), Theme.SubText,
+                if (TwoLine) Link(g, t.ArtistName, Theme.Small, new Rectangle(r.Left + title, cy + 24, titleW, 16), sub, i == _hotRow && _hotLink == "artist");
+                if (album > 0) Link(g, t.AlbumName, Theme.Normal, new Rectangle(r.Left + album, cy, dur - album - 12, _rowH), sub, i == _hotRow && _hotLink == "album");
+                Theme.Text1(g, Theme.Time(t.DurationMs), Theme.Normal, new Rectangle(r.Left + dur, cy, 50, _rowH), sub);
+                if (Has(TrackColumns.Popularity)) PopularityBars(g, r.Left + extra, cy + _rowH / 2 - 5, t.Popularity);
+                if (Has(TrackColumns.PlayCount))
+                    Theme.Draw(g, t.PlayCount.ToString("n0"), Theme.Normal, new Rectangle(r.Left + extra, cy, 110, _rowH), Theme.SubText,
                         TextFormatFlags.Right | TextFormatFlags.VerticalCenter);
-                using (Pen p = new Pen(Theme.Line)) g.DrawLine(p, row.Left + 10, row.Bottom - 1, row.Right - 10, row.Bottom - 1);
             }
         }
 
-
         // ---- sorting by clicking the column headers ----
-        void HeadLabel(Graphics g, string key, string text, int x, int y)
+        void HeadLabel(Graphics g, string key, string text, int x, int y, bool sorted)
         {
-            bool sorted = _sortKey == key;
-            Color c = sorted || _hotHead == key ? Theme.Text : Theme.SubText;
-            Theme.Text1(g, text, Theme.Label, new Rectangle(x, y, 200, 18), c);
-            if (!sorted) return;
-            int ax = x + Theme.Measure(text, Theme.Label).Width + 2, ay = y + 8;
+            Color c = sorted || _hotHead == key ? Theme.Text : Soft;
+            Theme.Text1(g, text, Theme.Small, new Rectangle(x, y, 200, 18), c);
+            if (sorted) SortArrow(g, x + Theme.Measure(text, Theme.Small).Width + 2, y + 8);
+        }
+
+        // green triangle beside the sorted column: up = ascending, down = descending
+        void SortArrow(Graphics g, int ax, int ay)
+        {
             using (SolidBrush b = new SolidBrush(Theme.Accent))
                 g.FillPolygon(b, _sortDesc ? new Point[] { new Point(ax, ay - 2), new Point(ax + 8, ay - 2), new Point(ax + 4, ay + 3) }
                                            : new Point[] { new Point(ax, ay + 3), new Point(ax + 8, ay + 3), new Point(ax + 4, ay - 2) });
@@ -463,15 +850,14 @@ namespace Spotipaq
 
         string HeadAt(Point p)
         {
-            if (!_header || p.Y < 0 || p.Y >= HeadH) return null;
-            int num, plus, title, artist, album, extra, dur;
-            Columns(_width, out num, out plus, out title, out artist, out album, out extra, out dur);
-            if ((_cols & TrackColumns.Number) != 0 && p.X >= num && p.X < plus) return "num";
+            if (!_header || p.Y < Tools || p.Y >= HeadHeight) return null;
+            int num, art, title, album, extra, dur;
+            Columns(_width, out num, out art, out title, out album, out extra, out dur);
+            if (Has(TrackColumns.Number) && p.X >= num && p.X < art) return "num";
             if (p.X >= dur && p.X < dur + 50) return "time";
-            if ((_cols & TrackColumns.Popularity) != 0 && p.X >= extra && p.X < extra + 90) return "pop";
+            if (Has(TrackColumns.Popularity) && p.X >= extra && p.X < extra + 90) return "pop";
             if (album > 0 && p.X >= album && p.X < dur - 12) return "album";
-            if (artist > 0 && p.X >= artist && p.X < (album > 0 ? album : dur) - 12) return "artist";
-            if (p.X >= title && p.X < (artist > 0 ? artist : album > 0 ? album : dur) - 12) return "song";
+            if (p.X >= art && p.X < (album > 0 ? album : dur) - 12) return "song";
             return null;
         }
 
@@ -488,21 +874,42 @@ namespace Spotipaq
             return 0;
         }
 
-        /// <summary>Click on a header: ascending, then descending, then back to the original order. "#" always restores the original order.</summary>
+        /// <summary>Click on a header. The title column steps through Title A-Z, Title Z-A, Artist A-Z, Artist Z-A, then
+        /// the original order; the others go ascending, descending, original. "#" always restores the original order.</summary>
         void SortBy(string key)
         {
             if (key == "num") { _sortKey = null; _sortDesc = false; }
+            else if (key == "song")
+            {
+                if (_sortKey != "song" && _sortKey != "artist") { _sortKey = "song"; _sortDesc = false; }
+                else if (!_sortDesc) _sortDesc = true;
+                else if (_sortKey == "song" && TwoLine) { _sortKey = "artist"; _sortDesc = false; }
+                else { _sortKey = null; _sortDesc = false; }
+            }
             else if (_sortKey != key) { _sortKey = key; _sortDesc = key == "pop"; }
             else if (!_sortDesc) _sortDesc = true;
             else { _sortKey = null; _sortDesc = false; }
+            Rebuild();
+        }
 
+        static bool Matches(string s, string f) { return s != null && s.IndexOf(f, StringComparison.CurrentCultureIgnoreCase) >= 0; }
+
+        /// <summary>Works out the rows to show: the original list, narrowed by the search text, in the chosen order.</summary>
+        void Rebuild()
+        {
             Track keep = _selected >= 0 && _selected < _tracks.Count ? _tracks[_selected] : null;
-            if (_sortKey == null) _tracks = _orig;
-            else
+            List<Track> list = _orig;
+            if (_filter.Length > 0)
+            {
+                list = new List<Track>();
+                foreach (Track t in _orig)
+                    if (Matches(t.Name, _filter) || Matches(t.ArtistName, _filter) || Matches(t.AlbumName, _filter)) list.Add(t);
+            }
+            if (_sortKey != null)
             {
                 Dictionary<Track, int> index = new Dictionary<Track, int>();
                 for (int i = 0; i < _orig.Count; i++) index[_orig[i]] = i;
-                List<Track> copy = new List<Track>(_orig);
+                List<Track> copy = new List<Track>(list);
                 string k = _sortKey; bool desc = _sortDesc;
                 copy.Sort(delegate (Track a, Track b)
                 {
@@ -510,18 +917,19 @@ namespace Spotipaq
                     if (r == 0) return index[a].CompareTo(index[b]);   // keep ties in the original order
                     return desc ? -r : r;
                 });
-                _tracks = copy;
+                list = copy;
             }
+            _tracks = list;
             _selected = keep == null ? -1 : _tracks.IndexOf(keep);
         }
 
-        static void Link(Graphics g, string text, Rectangle r, Color c, bool hot)
+        static void Link(Graphics g, string text, Font f, Rectangle r, Color c, bool hot)
         {
-            Theme.Text1(g, text, Theme.Normal, r, hot ? Theme.Text : c);
+            Theme.Text1(g, text, f, r, hot ? Theme.Text : c);
             if (hot)
             {
-                int w = Math.Min(r.Width, Theme.Measure(text, Theme.Normal).Width);
-                using (Pen p = new Pen(Theme.Text)) g.DrawLine(p, r.Left + 3, r.Top + r.Height / 2 + 7, r.Left + w - 4, r.Top + r.Height / 2 + 7);
+                int w = Math.Min(r.Width, Theme.Measure(text, f).Width), uy = r.Top + r.Height / 2 + f.Height / 2;
+                using (Pen p = new Pen(Theme.Text)) g.DrawLine(p, r.Left + 3, uy, r.Left + w - 4, uy);
             }
         }
 
@@ -543,15 +951,16 @@ namespace Spotipaq
                     g.FillRectangle(b, x + i * 4, y, 2, 10);
         }
 
-        int RowAt(Point p) { int i = (p.Y - HeadHeight) / RowH; return p.Y < HeadHeight || i < 0 || i >= _tracks.Count ? -1 : i; }
+        int RowAt(Point p) { int i = (p.Y - HeadHeight) / _rowH; return p.Y < HeadHeight || i < 0 || i >= _tracks.Count ? -1 : i; }
 
         string LinkAt(Point p, int row)
         {
             if (row < 0) return null;
-            int num, plus, title, artist, album, extra, dur;
-            Columns(_width, out num, out plus, out title, out artist, out album, out extra, out dur);
+            int num, art, title, album, extra, dur;
+            Columns(_width, out num, out art, out title, out album, out extra, out dur);
             Track t = _tracks[row];
-            if (artist > 0 && p.X >= artist && p.X < artist + Theme.Measure(t.ArtistName, Theme.Normal).Width && p.X < (album > 0 ? album : dur)) return "artist";
+            int ry = p.Y - HeadHeight - row * _rowH, titleEnd = (album > 0 ? album : dur) - 12;
+            if (TwoLine && ry >= 24 && ry < 42 && p.X >= title && p.X < title + Theme.Measure(t.ArtistName, Theme.Small).Width && p.X < titleEnd) return "artist";
             if (album > 0 && p.X >= album && p.X < album + Theme.Measure(t.AlbumName, Theme.Normal).Width && p.X < dur) return "album";
             return null;
         }
@@ -560,15 +969,29 @@ namespace Spotipaq
         {
             int row = RowAt(p);
             string link = LinkAt(p, row), head = HeadAt(p);
-            bool c = row != _hotRow || link != _hotLink || head != _hotHead;
-            _hotRow = row; _hotLink = link; _hotHead = head;
+            bool search = Searchable && p.Y < Tools && SearchRect.Contains(p);
+            bool c = row != _hotRow || link != _hotLink || head != _hotHead || search != _hotSearch;
+            _hotRow = row; _hotLink = link; _hotHead = head; _hotSearch = search;
             return c;
         }
-        public override bool MouseLeave() { bool c = _hotRow >= 0 || _hotHead != null; _hotRow = -1; _hotLink = null; _hotHead = null; return c; }
-        public override bool IsLink(Point p) { return _hotLink != null || _hotHead != null; }
+        public override bool MouseLeave() { bool c = _hotRow >= 0 || _hotHead != null || _hotSearch; _hotRow = -1; _hotLink = null; _hotHead = null; _hotSearch = false; return c; }
+        public override bool IsLink(Point p) { return _hotLink != null; }
+        public override Cursor CursorAt(Point p, PageView view)
+        {
+            if (_hotSearch)                                  // a text field, except over its X
+                return p.X >= SearchRect.Right - 30 && view.InputText(this).Length > 0 ? Cursors.Hand : Cursors.IBeam;
+            return _hotLink != null ? Cursors.Hand : Cursors.Default;      // column headers keep the arrow
+        }
 
         public override void Click(Point p, MouseButtons b, PageView view)
         {
+            if (Searchable && p.Y < Tools)
+            {
+                if (b != MouseButtons.Left || !SearchRect.Contains(p)) return;
+                if (p.X >= SearchRect.Right - 30 && view.InputText(this).Length > 0) view.ClearInput(this);   // the X
+                else view.ActivateInput(this);
+                return;
+            }
             if (b == MouseButtons.Left)
             {
                 string head = HeadAt(p);
@@ -585,11 +1008,11 @@ namespace Spotipaq
             }
             if (b == MouseButtons.Left && _hotLink == "artist") { view.Host.Navigate(new NavTarget(PageKind.Artist, _tracks[row].ArtistId)); return; }
             if (b == MouseButtons.Left && _hotLink == "album") { view.Host.Navigate(new NavTarget(PageKind.Album, _tracks[row].AlbumId)); return; }
-            int num, plus, title, artist, album, extra, dur;
-            Columns(_width, out num, out plus, out title, out artist, out album, out extra, out dur);
+            int num, art, title, album, extra, dur;
+            Columns(_width, out num, out art, out title, out album, out extra, out dur);
             Track playing = view.Host.PlayingTrack;
             // single click on the play glyph of the hovered row plays it (or pauses the current one)
-            if (b == MouseButtons.Left && (_cols & TrackColumns.Number) != 0 && p.X >= num && p.X < num + 30)
+            if (b == MouseButtons.Left && Has(TrackColumns.Number) && p.X >= num && p.X < num + 30)
             {
                 if (playing != null && playing.Id == _tracks[row].Id) view.Host.TogglePlayPause();
                 else view.Host.PlayList(_tracks, row);
@@ -648,7 +1071,13 @@ namespace Spotipaq
                     using (Pen p = new Pen(Theme.Accent, 2f))
                     {
                         if (tile.Round) { g.SmoothingMode = SmoothingMode.AntiAlias; g.DrawEllipse(p, art); g.SmoothingMode = SmoothingMode.None; }
-                        else g.DrawRectangle(p, art.Left, art.Top, art.Width - 1, art.Height - 1);
+                        else
+                        {
+                            g.SmoothingMode = SmoothingMode.AntiAlias;
+                            using (GraphicsPath gp = Theme.Rounded(new Rectangle(art.Left, art.Top, art.Width - 1, art.Height - 1), Theme.ArtRadius(art.Width)))
+                                g.DrawPath(p, gp);
+                            g.SmoothingMode = SmoothingMode.None;
+                        }
                     }
                 TextFormatFlags f = Theme.LeftEllipsis | (tile.Round ? TextFormatFlags.HorizontalCenter : 0);
                 Theme.Draw(g, tile.Title, Theme.NormalBold, new Rectangle(t.Left, art.Bottom + 6, _size, 18), i == _hot ? Theme.AccentHover : Theme.Text, f);

@@ -1,0 +1,3 @@
+Emoji artwork (emoji.png, emoji_big.png): Noto Color Emoji by Google.
+Images licensed under the Apache License, Version 2.0 (http://www.apache.org/licenses/LICENSE-2.0);
+the font they were rendered from is under the SIL Open Font License 1.1.
