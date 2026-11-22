@@ -79,7 +79,7 @@ namespace Spotipaq
 
         // ---- header overlay at the top of the card: back / forward on the left, the profile button on the right.
         // Clear over the page at first; once the page is scrolled it becomes a solid bar in the page's key colour.
-        public const int HeaderH = 52;
+        public const int HeaderH = 40;
         public bool CanBack, CanForward;
         public event EventHandler Back, Forward;
         public ContextMenuStrip UserMenu;      // shown by the profile button
@@ -88,9 +88,10 @@ namespace Spotipaq
         public string User { get { return _user; } }
         int _hdrHot;                           // 1 back, 2 forward, 3 profile, 4 search box, -1 elsewhere on the header
         int _solidAt = 120;                    // scroll position at which the bar has faded in completely
-        Rectangle BackRect { get { return new Rectangle(16, 10, 32, 32); } }
-        Rectangle ForwardRect { get { return new Rectangle(56, 10, 32, 32); } }
-        Rectangle UserRect { get { return new Rectangle(ClientSize.Width - BarW - 16 - 32, 10, 32, 32); } }
+        const int BtnD = 24, BtnY = (HeaderH - BtnD) / 2;       // the round buttons: diameter, and centred in the bar
+        Rectangle BackRect { get { return new Rectangle(16, BtnY, BtnD, BtnD); } }
+        Rectangle ForwardRect { get { return new Rectangle(16 + BtnD + 8, BtnY, BtnD, BtnD); } }
+        Rectangle UserRect { get { return new Rectangle(ClientSize.Width - BarW - 16 - BtnD, BtnY, BtnD, BtnD); } }
         int HeaderAt(Point p)
         {
             if (SearchShown && SearchRect.Contains(p)) return 4;      // wherever the box currently is, in the bar or below it
@@ -129,10 +130,11 @@ namespace Spotipaq
                 // to its docked place (never half in, half out).
                 int y = _searchBlock == null ? DockY : _searchBlock.Top - _scroll + 7;
                 if (y < HeaderH) y = DockY;
-                return new Rectangle(right - w, y, w, 32);
+                return new Rectangle(right - w, y, w, SearchH);
             }
         }
-        const int DockY = 10;                  // where the box rests in the top bar
+        const int SearchH = 24;
+        const int DockY = (HeaderH - SearchH) / 2;      // where the box rests in the top bar
         bool SearchShown { get { return _searchBlock != null && SearchRect.Width >= 100; } }
         bool SearchHasText { get { return _searchBlock != null && InputText(_searchBlock).Length > 0; } }
 
@@ -158,21 +160,21 @@ namespace Spotipaq
             if (!g.IsVisible(s)) return;                 // a partial repaint elsewhere (hovering rows): nothing to do
             Theme.FillRounded(g, s, 4, SearchBack());
             g.SmoothingMode = SmoothingMode.AntiAlias;
-            using (Pen lens = new Pen(SearchSoft, 1.6f))
+            using (Pen lens = new Pen(SearchSoft, 1.5f))
             {
-                g.DrawEllipse(lens, s.Left + 10, s.Top + 10, 9, 9);
-                g.DrawLine(lens, s.Left + 18, s.Top + 18, s.Left + 22, s.Top + 22);
+                g.DrawEllipse(lens, s.Left + 9, s.Top + 7, 7.5f, 7.5f);
+                g.DrawLine(lens, s.Left + 15.6f, s.Top + 13.6f, s.Left + 19, s.Top + 17);
             }
             if (SearchHasText)
                 using (Pen x = new Pen(_hdrHot == 4 ? Color.White : SearchSoft, 1.6f))
                 {
-                    int cx = s.Right - 16, cy = s.Top + s.Height / 2;
-                    g.DrawLine(x, cx - 4, cy - 4, cx + 4, cy + 4);
-                    g.DrawLine(x, cx - 4, cy + 4, cx + 4, cy - 4);
+                    float cx = s.Right - 14, cy = s.Top + s.Height / 2f;
+                    g.DrawLine(x, cx - 3.5f, cy - 3.5f, cx + 3.5f, cy + 3.5f);
+                    g.DrawLine(x, cx - 3.5f, cy + 3.5f, cx + 3.5f, cy - 3.5f);
                 }
             g.SmoothingMode = SmoothingMode.None;
             if (!InputWanted(_searchBlock))
-                Theme.Text1(g, "Search in playlist", Theme.Normal, new Rectangle(s.Left + 32, s.Top, s.Width - 40, s.Height), SearchSoft);
+                Theme.Text1(g, "Search in playlist", Theme.Normal, new Rectangle(s.Left + 28, s.Top, s.Width - 36, s.Height), SearchSoft);
         }
 
         public void ActivateInput(Block b)
@@ -198,7 +200,7 @@ namespace Spotipaq
             if (_inputOwner == null || !_inputWanted || !SearchShown) { if (_input.Visible) _input.Visible = false; return; }
             Rectangle f = SearchRect;
             int h = _input.PreferredHeight;
-            Rectangle s = new Rectangle(f.Left + 32, f.Top + (f.Height - h) / 2, f.Width - 32 - 30, h);
+            Rectangle s = new Rectangle(f.Left + 28, f.Top + (f.Height - h) / 2, f.Width - 28 - 26, h);
             Color back = SearchBack();
             if (_input.BackColor != back) _input.BackColor = back;
             if (_input.Bounds != s) _input.Bounds = s;
@@ -347,10 +349,10 @@ namespace Spotipaq
             Chevron(g, ForwardRect, false, CanForward, _hdrHot == 2);
             Rectangle u = UserRect;
             int cx = u.Left + u.Width / 2, cy = u.Top + u.Height / 2;
-            using (Pen p = new Pen(_hdrHot == 3 ? Color.White : Color.FromArgb(200, 200, 200), 1.6f))
+            using (Pen p = new Pen(_hdrHot == 3 ? Color.White : Color.FromArgb(200, 200, 200), 1.4f))
             {
-                g.DrawEllipse(p, cx - 4, cy - 8, 8, 8);                    // head
-                g.DrawArc(p, cx - 7, cy + 2, 14, 12, 180, 180);            // shoulders
+                g.DrawEllipse(p, cx - 3, cy - 7, 6, 6);                    // head
+                g.DrawArc(p, cx - 5.5f, cy + 1, 11, 10, 180, 180);         // shoulders
             }
             g.SmoothingMode = SmoothingMode.None;
         }
@@ -364,11 +366,11 @@ namespace Spotipaq
         {
             Color c = !enabled ? Color.FromArgb(95, 95, 95) : hot ? Color.White : Color.FromArgb(200, 200, 200);
             int cx = r.Left + r.Width / 2, cy = r.Top + r.Height / 2, d = left ? 1 : -1;
-            using (Pen p = new Pen(c, 1.8f))
+            using (Pen p = new Pen(c, 1.6f))
             {
                 p.StartCap = LineCap.Round; p.EndCap = LineCap.Round;
-                g.DrawLine(p, cx + 2 * d, cy - 6, cx - 3 * d, cy);
-                g.DrawLine(p, cx - 3 * d, cy, cx + 2 * d, cy + 6);
+                g.DrawLine(p, cx + 1.5f * d, cy - 4.5f, cx - 2.5f * d, cy);
+                g.DrawLine(p, cx - 2.5f * d, cy, cx + 1.5f * d, cy + 4.5f);
             }
         }
 
@@ -536,7 +538,7 @@ namespace Spotipaq
                 else if (hh == 3 && UserMenu != null) UserMenu.Show(this, new Point(UserRect.Right, UserRect.Bottom + 4), ToolStripDropDownDirection.BelowLeft);
                 else if (hh == 4)
                 {
-                    if (e.X >= SearchRect.Right - 30 && SearchHasText) ClearInput(_searchBlock);      // the X
+                    if (e.X >= SearchRect.Right - 26 && SearchHasText) ClearInput(_searchBlock);      // the X
                     else ActivateInput(_searchBlock);
                 }
                 return;
@@ -570,7 +572,7 @@ namespace Spotipaq
             if (hh != 0)
             {
                 LeaveHot();
-                if (hh == 4) Cursor = e.X >= SearchRect.Right - 30 && SearchHasText ? Cursors.Hand : Cursors.IBeam;      // a text field, except over its X
+                if (hh == 4) Cursor = e.X >= SearchRect.Right - 26 && SearchHasText ? Cursors.Hand : Cursors.IBeam;      // a text field, except over its X
                 else Cursor = hh == 3 || (hh == 1 && CanBack) || (hh == 2 && CanForward) ? Cursors.Hand : Cursors.Default;
                 return;
             }
@@ -749,8 +751,8 @@ namespace Spotipaq
             int x = TextLeft;
             for (int j = 0; j < i; j++) x += _buttons[j].Width + 12;
             int rowH = PageButton.RowHeight(_buttons), h = _buttons[i].Height;
-            if (Banner) return new Rectangle(x, BannerBottom + 10 + (rowH - h) / 2, _buttons[i].Width, h);      // a row under the banner
-            return new Rectangle(x, PadY + Art - rowH + (rowH - h) / 2, _buttons[i].Width, h);                 // bottom of the row lines up with the cover's
+            if (Banner) return new Rectangle(x, BannerBottom + 6 + (rowH - h) / 2, _buttons[i].Width, h);      // a row under the banner
+            return new Rectangle(x, PadY + Art - 4 - rowH + (rowH - h) / 2, _buttons[i].Width, h);                 // bottom of the row lines up with the cover's
         }
         Rectangle ByRect()
         {
@@ -934,7 +936,7 @@ namespace Spotipaq
         string _hotLink;                      // "artist" / "album" while over a link
         int _linkRow = -1, _linkArtistW, _linkAlbumW;      // text widths of the row under the pointer (measured once per row)
         string _filter = "";                  // what was typed into the search box
-        const int HeadH = 32, Pad = 30, ToolsH = 46;
+        const int HeadH = 32, Pad = 30, ToolsH = 38;       // ToolsH: the 24 px search box with 7 px above and below
         readonly int _rowH, _artSize;
         static readonly Color Soft = Color.FromArgb(179, 179, 179);
 

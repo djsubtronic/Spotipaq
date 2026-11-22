@@ -713,17 +713,6 @@ namespace Spotipaq
         /// <summary>Called on the UI thread when the application receives a Spotify link.</summary>
         public void OpenSpotifyLink(string link)
         {
-            // A search link (spotify:search:..., open.spotify.com/search/...) opens the search page.
-            string query = SearchQueryFromLink(link);
-            if (query != null)
-            {
-                if (WindowState == FormWindowState.Minimized) WindowState = FormWindowState.Normal;
-                Show(); Activate();
-                _top.SearchBox.Text = query;
-                Navigate(new NavTarget(PageKind.Search, query));
-                return;
-            }
-
             string kind, id;
             if (!TrySpotifyLink(link, out kind, out id))
             {
@@ -791,35 +780,6 @@ namespace Spotipaq
                 for (int i = 0; i < tracks.Count; i++)
                     if (tracks[i].Id == trackId) { index = i; break; }
             PlayList(tracks, index);
-        }
-
-        // The search text of a Spotify search link, or null if the link is not one:
-        //   spotify:search:daft+punk+one+more+time     https://open.spotify.com/search/daft%20punk
-        static string SearchQueryFromLink(string raw)
-        {
-            if (String.IsNullOrEmpty(raw)) return null;
-            raw = raw.Trim().Trim('"');
-            string encoded;
-            if (raw.StartsWith("spotify:search:", StringComparison.OrdinalIgnoreCase))
-                encoded = raw.Substring(15);
-            else
-            {
-                Uri uri;
-                if (!Uri.TryCreate(raw, UriKind.Absolute, out uri) ||
-                    (uri.Scheme != "https" && uri.Scheme != "http") ||
-                    !uri.Host.Equals("open.spotify.com", StringComparison.OrdinalIgnoreCase)) return null;
-                string path = uri.AbsolutePath.Trim('/');
-                if (path.StartsWith("intl-", StringComparison.OrdinalIgnoreCase))
-                    path = path.Substring(path.IndexOf('/') + 1);
-                if (!path.StartsWith("search/", StringComparison.OrdinalIgnoreCase)) return null;
-                encoded = path.Substring(7);
-                int slash = encoded.IndexOf('/');           // .../search/<query>/tracks
-                if (slash >= 0) encoded = encoded.Substring(0, slash);
-            }
-            string query;
-            try { query = Uri.UnescapeDataString(encoded.Replace('+', ' ')).Trim(); }
-            catch (UriFormatException) { return null; }
-            return query.Length > 0 ? query : null;
         }
 
         static bool TrySpotifyLink(string raw, out string kind, out string id)
@@ -1291,7 +1251,7 @@ namespace Spotipaq
         {
             List<Block> b = new List<Block>();
             List<PageButton> buttons = new List<PageButton>();
-            buttons.Add(new PageButton("PLAY", true, 44, "play", delegate { PlayList(a.Tracks, 0); }));
+            buttons.Add(new PageButton("PLAY", true, 34, "play", delegate { PlayList(a.Tracks, 0); }));
             buttons.Add(new PageButton("SAVE", false, 100, null));
             b.Add(new HeaderBlock(a.Type, a.Name, null, a.ArtistName, new NavTarget(PageKind.Artist, a.ArtistId),
                 new string[] { a.Year > 0 ? a.Year.ToString() : null, SongCount(a.Tracks) }, ", " + Duration(a.Tracks), a.ImageUrl, buttons));
@@ -1309,8 +1269,8 @@ namespace Spotipaq
         {
             List<Block> b = new List<Block>();
             List<PageButton> buttons = new List<PageButton>();
-            buttons.Add(new PageButton("PLAY", true, 44, "play", delegate { PlayList(p.Tracks, 0); }));
-            PageButton shuffle = new PageButton("SHUFFLE", false, 36, "ic_shuffle_big", delegate { SetShuffle(!_shuffle); });
+            buttons.Add(new PageButton("PLAY", true, 34, "play", delegate { PlayList(p.Tracks, 0); }));
+            PageButton shuffle = new PageButton("SHUFFLE", false, 28, "ic_shuffle_big", delegate { SetShuffle(!_shuffle); });
             shuffle.On = delegate { return _shuffle; };
             buttons.Add(shuffle);
             if (!_libraryIds.ContainsKey(p.Id)) buttons.Add(new PageButton("SAVE", false, 100, delegate { SavePlaylistToLibrary(p); }));
@@ -1329,7 +1289,7 @@ namespace Spotipaq
         {
             List<Block> b = new List<Block>();
             List<PageButton> buttons = new List<PageButton>();
-            buttons.Add(new PageButton("PLAY", true, 44, "play", delegate { PlayList(page.Popular, 0); }));
+            buttons.Add(new PageButton("PLAY", true, 34, "play", delegate { PlayList(page.Popular, 0); }));
             buttons.Add(new PageButton("FOLLOW", false, 100, null));
             b.Add(new ArtistHeaderBlock(page.Artist, buttons));
             if (page.Popular.Count > 0)
