@@ -5,7 +5,8 @@
  * bytes in with spq_audio_feed() (decrypted here); a decoder thread demuxes Ogg, decodes Vorbis (spq_vorbis.c,
  * x87 floats only - no SSE, this runs on a Pentium II) and plays through waveOut. One stream at a time.
  *
- * Two threads per stream. The decoder runs up to 1.5 s ahead into a ring of 16-bit samples. The feeder hands the
+ * Two threads per stream. The decoder runs up to 1.4 s ahead into a ring of 16-bit samples (filled gently: see
+ * FILL_EXTRA). The feeder hands the
  * device about 0.14 s of that at a time; it does almost no work (a copy and a gain), so it can run at time-critical
  * priority without hurting anything, and nothing the UI does can make it late - while the decoder, which does the
  * real work at a modest priority, has the whole ring as a cushion when the UI is busy. (As one thread just above
@@ -28,7 +29,10 @@
 #define RING_FRAMES 65536              /* decoded audio waiting to be played (a power of two): 1.5 s at 44.1 kHz */
 #define RING_MASK (RING_FRAMES - 1)
 #define MAX_OUT 4096                   /* most frames one Vorbis packet can produce */
-#define PACE_FRAMES 16384              /* with this much decoded, decode at the pace the device plays (no CPU bursts) */
+#define PACE_FRAMES 16384              /* up to this much (0.37 s) is decoded flat out, so a track starts at once... */
+#define FILL_EXTRA 1                   /* ...then this many extra packets per wait until the ring is full: about twice
+                                          the pace the device plays, so the full 1.4 s cushion builds over the next
+                                          second or so without a CPU burst, and then it is one packet in, one out */
 #define NBUF 8
 #define OUT_FRAMES 1024                /* one waveOut buffer: 23 ms */
 #define QUEUE 6                        /* buffers kept queued in the device: about 0.14 s */
@@ -311,7 +315,7 @@ static int open_wave(Sess* s)
 static DWORD WINAPI dec_thread(LPVOID arg)
 {
     Sess* s = (Sess*)arg;
-    int idx = 0, errors = 0;
+    int idx = 0, errors = 0, credit = 0;
     HANDLE ev[3];
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
 
@@ -372,13 +376,17 @@ static DWORD WINAPI dec_thread(LPVOID arg)
                     }
                     if (eos) { InterlockedExchange(&s->eof, 1); SetEvent(s->ev_wave); }
                 }
-                /* Far enough ahead: one packet per device buffer is plenty, so wait for the feeder instead of
-                 * racing to fill the ring (that burst is what made the UI stutter when a track started). */
+                /* Far enough ahead to be safe for now: no racing to fill the ring (that burst is what made the UI
+                 * stutter when a track started). But one packet per device buffer only ever held the ring at
+                 * PACE_FRAMES, a third of a second - less than another app's burst of painting can hold this
+                 * thread up for, and the music stopped. So a little more than the device plays is decoded after
+                 * each wait until the ring is full (the room check above stops it there): a cushion of 1.4 s. */
                 if (ring_avail(s) < PACE_FRAMES) progressed = 1;
+                else if (credit > 0) { credit--; progressed = 1; }
             }
         }
 
-        if (!progressed) WaitForMultipleObjects(3, ev, FALSE, 40);
+        if (!progressed) { WaitForMultipleObjects(3, ev, FALSE, 40); credit = FILL_EXTRA; }
     }
 
 done:
