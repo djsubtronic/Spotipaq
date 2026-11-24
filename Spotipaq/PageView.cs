@@ -5,6 +5,7 @@ using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
+using System.Runtime.InteropServices;
 using System.Windows.Forms;
 
 namespace Spotipaq
@@ -66,6 +67,93 @@ namespace Spotipaq
         public virtual Color KeyColor { get { return Color.Empty; } }
         /// <summary>Drops the block's selection (a clicked row), if it has one. True = it had one, repaint.</summary>
         public virtual bool ClearSelection() { return false; }
+        /// <summary>The part of the block that animates while music plays (the playing song's bars, see Equalizer),
+        /// in block coordinates; Empty = nothing. Asked each animation frame, so it should be cheap.</summary>
+        public virtual Rectangle AnimatedRect(PageView view) { return Rectangle.Empty; }
+        /// <summary>Paints just AnimatedRect's content, over the page's plain background already drawn there
+        /// (r = the block's on-screen bounds, as in Paint). By default the whole block's Paint.</summary>
+        public virtual void PaintAnimated(Graphics g, Rectangle r, PageView view) { Paint(g, r, view); }
+        /// <summary>The solid colour behind AnimatedRect (a selected row's highlight); Empty = the page's own background.</summary>
+        public virtual Color AnimatedBack(PageView view) { return Color.Empty; }
+    }
+
+    /// <summary>
+    /// The playing song's little bouncing bars, in place of its track number (as on Spotify). Not tied to the
+    /// sound: each bar loops its own short pattern, at a different length, so together they look random.
+    ///
+    /// Heights follow the clock, not the frame count, so the look stays the same at any frame rate. PageView's
+    /// timer draws each frame straight onto the window, changing only the pixels whose bars grew or shrank
+    /// (see PageView.AnimateEqualizer); a normal repaint draws them with Draw, which also notes what is on
+    /// screen so the next frame knows what to change.
+    /// </summary>
+    public static class Equalizer
+    {
+        public const int Interval = 65;         // ms per frame (about 15 a second)
+        const int GlideMs = 100;                // a bar's move from one height of its pattern to the next
+
+        // heights in 16ths of the full height; pattern lengths 7, 9, 11, 13 so the four rarely line up
+        static readonly byte[][] Patterns = {
+            new byte[] { 6, 12, 16, 11, 7, 4, 9 },
+            new byte[] { 14, 9, 5, 8, 13, 16, 12, 7, 10 },
+            new byte[] { 4, 8, 13, 16, 10, 6, 11, 15, 9, 5, 7 },
+            new byte[] { 11, 15, 10, 5, 3, 8, 14, 16, 12, 7, 4, 6, 9 }
+        };
+        public const int Count = 4;
+        public const int BarW = 2, Gap = 1, MaxH = 13;
+
+        // what was last drawn where (screen rectangle of the cell, bar heights in px); Empty = not known
+        public static Rectangle ShownCell = Rectangle.Empty;
+        public static readonly int[] Shown = new int[Count];
+
+        /// <summary>The bars' heights now, in pixels.</summary>
+        public static void Heights(int[] into)
+        {
+            long ms = Environment.TickCount & 0x7FFFFFFF;
+            long step = ms / GlideMs;
+            double t = (ms % GlideMs) / (double)GlideMs;
+            t = t * t * (3 - 2 * t);                    // ease in and out
+            for (int i = 0; i < Count; i++)
+            {
+                byte[] p = Patterns[i];
+                double from = p[step % p.Length], to = p[(step + 1) % p.Length];
+                into[i] = Math.Max(2, (int)Math.Round((from + (to - from) * t) * MaxH / 16));
+            }
+        }
+
+        /// <summary>Left edge of the first bar and the bars' bottom line, for a cell.</summary>
+        public static void Place(Rectangle cell, out int x, out int bottom)
+        {
+            int w = Count * BarW + (Count - 1) * Gap;
+            x = cell.Left + (cell.Width - w) / 2;
+            bottom = cell.Top + (cell.Height + MaxH) / 2;
+        }
+
+        /// <summary>The bars' own box in a cell.</summary>
+        public static Rectangle Box(Rectangle cell)
+        {
+            int x, bottom;
+            Place(cell, out x, out bottom);
+            return new Rectangle(x, bottom - MaxH, Count * BarW + (Count - 1) * Gap, MaxH);
+        }
+
+        static readonly int[] _now = new int[Count];
+
+        /// <summary>Draws the bars as they are now in a cell (screen coordinates).</summary>
+        public static void Draw(Graphics g, Rectangle cell, Color colour)
+        {
+            Heights(_now);
+            int x, bottom;
+            Place(cell, out x, out bottom);
+            using (SolidBrush b = new SolidBrush(colour))
+                for (int i = 0; i < Count; i++)
+                    g.FillRectangle(b, x + i * (BarW + Gap), bottom - _now[i], BarW, _now[i]);
+            // only trusted as "on screen" when this paint covers the whole box (a clipped paint may not show it)
+            if (g.ClipBounds.Contains(Box(cell)))
+            {
+                ShownCell = cell;
+                Array.Copy(_now, Shown, Count);
+            }
+        }
     }
 
     public sealed class PageView : Control
@@ -107,7 +195,7 @@ namespace Spotipaq
         Color _key;
         Bitmap _grad;
 
-        void DropGradient() { if (_grad != null) { _grad.Dispose(); _grad = null; } }
+        void DropGradient() { if (_grad != null) { _grad.Dispose(); _grad = null; } _gradColumn = null; }
 
         // ---- "Search in playlist", on pages whose track list asks for one (Block.WantsSearch). It sits in the row the
         // list leaves free above its column headers and scrolls with the page - until it reaches the top bar, where it
@@ -387,6 +475,123 @@ namespace Spotipaq
             SetUpInput();
             _bar.TopInset = HeaderH;                   // the up arrow starts just under the header...
             _bar.BottomInset = Theme.CardRadius;       // ...and the down arrow ends where the bottom corner starts to curve
+            _eqTimer.Interval = Equalizer.Interval;
+            _eqTimer.Tick += delegate { AnimateEqualizer(); };
+            _eqTimer.Start();
+        }
+
+        // ---- the playing song's bars (Equalizer). Each frame changes only the bars' pixels that need it, drawn
+        // straight onto the window (plain GDI, no repaint of the page). Where that isn't safe - the row partly under
+        // the top bar or pinned headers, or what is on screen isn't known - the cell is repainted instead
+        // (OnPaint's quick path: background + bars only).
+        readonly Timer _eqTimer = new Timer();
+        Block _eqBlock;                     // a quick repaint of the bars is waiting: this block,
+        Rectangle _eqRect;                  // ...at this rectangle (screen)
+        readonly int[] _eqNow = new int[Equalizer.Count];
+        Color[] _gradColumn;                // the page gradient's colour at each row of it (it only varies downwards)
+
+        [DllImport("user32.dll")] static extern IntPtr GetDC(IntPtr hwnd);
+        [DllImport("user32.dll")] static extern int ReleaseDC(IntPtr hwnd, IntPtr dc);
+        [DllImport("user32.dll")] static extern int FillRect(IntPtr dc, ref RECT r, IntPtr brush);
+        [DllImport("gdi32.dll")] static extern IntPtr GetStockObject(int obj);
+        [DllImport("gdi32.dll")] static extern int SetDCBrushColor(IntPtr dc, int colour);
+        [StructLayout(LayoutKind.Sequential)] struct RECT { public int Left, Top, Right, Bottom; }
+        const int DC_BRUSH = 18;
+
+        void AnimateEqualizer()
+        {
+            if (!Visible || !_host.IsPlaying || _host.PlayingTrack == null) return;
+            Form f = FindForm();
+            if (f != null && f.WindowState == FormWindowState.Minimized) return;
+            Block pin = Pinned();
+            int top = HeaderH + (pin != null ? pin.PinHeight : 0);         // below the top bar and any pinned headers
+            foreach (Block b in _blocks)
+            {
+                Rectangle a = b.AnimatedRect(this);
+                if (a.IsEmpty) continue;
+                Rectangle s = new Rectangle(a.Left, b.Top - _scroll + a.Top, a.Width, a.Height);
+                if (s.Bottom <= HeaderH || s.Top >= ClientSize.Height) continue;      // scrolled out of sight
+                bool open = s.Top >= top && s.Bottom <= ClientSize.Height;
+                if (open && Equalizer.ShownCell == s && IsHandleCreated)
+                {
+                    DrawBarChanges(s, b.AnimatedBack(this));
+                    continue;
+                }
+                Equalizer.ShownCell = Rectangle.Empty;
+                if (open && _eqBlock == null) { _eqBlock = b; _eqRect = s; }
+                Invalidate(s);
+            }
+        }
+
+        // Grows / shrinks each bar on screen by the pixels that changed since the last frame.
+        void DrawBarChanges(Rectangle cell, Color back)
+        {
+            Equalizer.Heights(_eqNow);
+            int[] was = Equalizer.Shown;
+            bool same = true;
+            for (int i = 0; i < Equalizer.Count; i++) if (_eqNow[i] != was[i]) { same = false; break; }
+            if (same) return;
+            int x, bottom;
+            Equalizer.Place(cell, out x, out bottom);
+            IntPtr dc = GetDC(Handle);
+            if (dc == IntPtr.Zero) return;
+            try
+            {
+                IntPtr brush = GetStockObject(DC_BRUSH);
+                int green = ColorTranslator.ToWin32(Theme.Accent);
+                for (int i = 0; i < Equalizer.Count; i++)
+                {
+                    int bx = x + i * (Equalizer.BarW + Equalizer.Gap), h = _eqNow[i], o = was[i];
+                    if (h > o)          // grew: the new top in green
+                    {
+                        SetDCBrushColor(dc, green);
+                        Fill(dc, brush, bx, bottom - h, bottom - o);
+                    }
+                    else if (h < o)     // shrank: the old top back to the background
+                    {
+                        if (back != Color.Empty || !InGradient(bottom - o))
+                        {
+                            SetDCBrushColor(dc, ColorTranslator.ToWin32(back != Color.Empty ? back : Theme.Main));
+                            Fill(dc, brush, bx, bottom - o, bottom - h);
+                        }
+                        else
+                            for (int y = bottom - o; y < bottom - h; y++)       // the gradient, row by row
+                            {
+                                SetDCBrushColor(dc, ColorTranslator.ToWin32(GradientAt(y)));
+                                Fill(dc, brush, bx, y, y + 1);
+                            }
+                    }
+                    was[i] = h;
+                }
+            }
+            finally { ReleaseDC(Handle, dc); }
+        }
+
+        static void Fill(IntPtr dc, IntPtr brush, int x, int top, int bottom)
+        {
+            RECT r;
+            r.Left = x; r.Right = x + Equalizer.BarW; r.Top = top; r.Bottom = bottom;
+            FillRect(dc, ref r, brush);
+        }
+
+        // is screen row y over the page's gradient (see PaintGradient)?
+        bool InGradient(int y) { return _haveKey && _grad != null && y + _scroll < _grad.Height; }
+
+        Color GradientAt(int y)
+        {
+            if (_gradColumn == null || _gradColumn.Length != _grad.Height)
+            {
+                _gradColumn = new Color[_grad.Height];
+                for (int i = 0; i < _gradColumn.Length; i++) _gradColumn[i] = _grad.GetPixel(0, i);
+            }
+            int gy = y + _scroll;
+            return gy >= 0 && gy < _gradColumn.Length ? _gradColumn[gy] : Theme.Main;
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing) _eqTimer.Dispose();
+            base.Dispose(disposing);
         }
 
         public IPageHost Host { get { return _host; } }
@@ -434,6 +639,21 @@ namespace Spotipaq
 
         protected override void OnPaint(PaintEventArgs e)
         {
+            // An animation frame of the playing song's bars, with nothing else to repaint: the background and the
+            // bars only - not the whole row (its cover, text) and the page's overlays, 20 times a second.
+            Block eq = _eqBlock;
+            _eqBlock = null;
+            if (eq != null && e.ClipRectangle == _eqRect && _blocks.Contains(eq))
+            {
+                Equalizer.ShownCell = Rectangle.Empty;
+                e.Graphics.Clear(Theme.Main);
+                PaintGradient(e.Graphics);
+                eq.PaintAnimated(e.Graphics, new Rectangle(0, eq.Top - _scroll, _layoutWidth, eq.Height), this);
+                return;
+            }
+            // whatever this paint puts over the bars' cell, the next frame can't assume what is there (Equalizer.Draw
+            // notes it again if it draws them)
+            if (!Equalizer.ShownCell.IsEmpty && e.ClipRectangle.IntersectsWith(Equalizer.ShownCell)) Equalizer.ShownCell = Rectangle.Empty;
             EnsureLayout();
             Graphics g = e.Graphics;
             g.Clear(Theme.Main);
@@ -1007,9 +1227,12 @@ namespace Spotipaq
                 if (Has(TrackColumns.Number))
                 {
                     Rectangle nr = new Rectangle(r.Left + num, cy, 30, _rowH);
-                    if (i == _hotRow || isPlaying) DrawPlayGlyph(g, nr, isPlaying && view.Host.IsPlaying, isPlaying);
-                    else Theme.Draw(g, (t.Number > 0 && !Has(TrackColumns.Art) ? t.Number : i + 1).ToString(), Theme.Normal, nr, Theme.SubText,
-                        TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
+                    // as on Spotify: the pointer's row shows play / pause; the playing song bouncing bars, or
+                    // (paused) its number in green; any other row its number
+                    if (i == _hotRow) DrawPlayGlyph(g, nr, isPlaying && view.Host.IsPlaying, isPlaying);
+                    else if (isPlaying && view.Host.IsPlaying) Equalizer.Draw(g, nr, Theme.Accent);
+                    else Theme.Draw(g, (t.Number > 0 && !Has(TrackColumns.Art) ? t.Number : i + 1).ToString(), Theme.Normal, nr,
+                        isPlaying ? Theme.Accent : Theme.SubText, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
                 }
                 if (Has(TrackColumns.Art))
                     Theme.Art(g, view.Host.Images.Get(t.AlbumImageUrl, _artSize, _artSize), new Rectangle(r.Left + art, cy + (_rowH - _artSize) / 2, _artSize, _artSize), false);
@@ -1161,6 +1384,39 @@ namespace Spotipaq
                 int w = Math.Min(r.Width, Theme.Measure(text, f).Width), uy = r.Top + r.Height / 2 + f.Height / 2;
                 using (Pen p = new Pen(Theme.Text)) g.DrawLine(p, r.Left + 3, uy, r.Left + w - 4, uy);
             }
+        }
+
+        // the playing song's bars (Equalizer), unless the pointer is on its row (then it shows play / pause)
+        List<Track> _eqList;                // the playing song's row, found once per list / song
+        string _eqId;
+        int _eqRow = -1;
+        public override Rectangle AnimatedRect(PageView view)
+        {
+            Track playing = view.Host.PlayingTrack;
+            if (playing == null || !Has(TrackColumns.Number)) return Rectangle.Empty;
+            if (!ReferenceEquals(_eqList, _tracks) || _eqId != playing.Id)
+            {
+                _eqList = _tracks; _eqId = playing.Id; _eqRow = -1;
+                for (int i = 0; i < _tracks.Count; i++) if (_tracks[i].Id == playing.Id) { _eqRow = i; break; }
+            }
+            if (_eqRow < 0 || _eqRow == _hotRow) return Rectangle.Empty;
+            int num, art, title, album, extra, dur;
+            Columns(_width, out num, out art, out title, out album, out extra, out dur);
+            return new Rectangle(num, HeadHeight + _eqRow * _rowH, 30, _rowH);
+        }
+
+        public override Color AnimatedBack(PageView view) { return _eqRow >= 0 && _eqRow == _selected ? Theme.RowSelected : Color.Empty; }
+
+        // one frame of the bars alone (PageView's quick path): the row's highlight if it is selected, then the bars
+        public override void PaintAnimated(Graphics g, Rectangle r, PageView view)
+        {
+            if (_eqRow < 0 || _eqRow >= _tracks.Count || !ReferenceEquals(_eqList, _tracks)) { Paint(g, r, view); return; }
+            Rectangle cell = AnimatedRect(view);
+            if (cell.IsEmpty) return;
+            cell.Offset(r.Left, r.Top);
+            if (_eqRow == _selected)
+                using (SolidBrush b = new SolidBrush(Theme.RowSelected)) g.FillRectangle(b, cell);
+            if (view.Host.IsPlaying) Equalizer.Draw(g, cell, Theme.Accent);
         }
 
         static void DrawPlayGlyph(Graphics g, Rectangle r, bool pause, bool green)
