@@ -85,13 +85,18 @@ namespace Spotipaq
 
             // Covers arrive one by one; repainting everything for each made a page of thumbnails repaint dozens of times.
             _artPaint.Interval = 60;
-            _artPaint.Tick += delegate { _artPaint.Stop(); _page.Invalidate(); _bar.Invalidate(); _sidebar.Invalidate(); };
+            // Not in the middle of a scroll, though: that repaint would stall it. The timer just keeps waiting.
+            _artPaint.Tick += delegate
+            {
+                if (_page.Scrolling || _sidebar.Scrolling) return;
+                _artPaint.Stop(); _page.Invalidate(); _bar.Invalidate(); _sidebar.Invalidate();
+            };
             _images.Loaded += delegate { if (!_artPaint.Enabled) _artPaint.Start(); };
             // emoji: read the index now, off the UI thread; repaint when a sprite sheet has been decoded in the background
             Emoji.Warm();
             Emoji.SheetLoaded += delegate
             {
-                try { if (IsHandleCreated && !IsDisposed) BeginInvoke(new MethodInvoker(delegate { _page.Invalidate(); _sidebar.Invalidate(); _bar.Invalidate(); _title.Invalidate(); })); }
+                try { if (IsHandleCreated && !IsDisposed) BeginInvoke(new MethodInvoker(delegate { _page.Redraw(); _sidebar.Invalidate(); _bar.Invalidate(); _title.Invalidate(); })); }
                 catch (Exception) { }
             };
             _sidebar.ItemClicked += delegate (object s, NavEventArgs e) { Navigate(e.Target); };
@@ -591,7 +596,11 @@ namespace Spotipaq
             base.OnLoad(e);
             if (_settings.GetBool("win.max", false)) WindowState = FormWindowState.Maximized;
             TrackWindow();
-            _sidebar.SetPlaylists(null);
+            // the list as it was last time, straight away; the fresh one replaces it below if anything changed
+            List<Playlist> saved = null;
+            try { saved = _backend.GetCachedPlaylists(); } catch (Exception) { }
+            if (saved != null) { _myPlaylists = saved; _libraryIds.Clear(); foreach (Playlist x in saved) _libraryIds[x.Id] = true; }
+            _sidebar.SetPlaylists(Ordered(saved));
             _page.SetUser("Connecting...");
             _bar.Volume = _player.Volume;
             RefreshBar();
@@ -608,7 +617,10 @@ namespace Spotipaq
             });
             Async.Run(this, delegate { return _backend.GetPlaylists(); }, delegate (List<Playlist> p, Exception err)
             {
-                if (p != null) { _myPlaylists = p; _libraryIds.Clear(); foreach (Playlist x in p) _libraryIds[x.Id] = true; }
+                if (p == null) return;                // offline: keep the saved list (if any)
+                bool same = SameList(_myPlaylists, p);
+                _myPlaylists = p; _libraryIds.Clear(); foreach (Playlist x in p) _libraryIds[x.Id] = true;
+                if (same) return;                     // nothing to redraw
                 _sidebar.SetPlaylists(Ordered(p)); _sidebar.SetCurrent(Current);
             });
             NavTarget start = new NavTarget(PageKind.Browse, null);
@@ -619,6 +631,19 @@ namespace Spotipaq
             }
             catch { }
             Navigate(start);
+        }
+
+        /// <summary>True when two sidebar lists would look the same: same playlists, order, names, owners, covers.</summary>
+        static bool SameList(List<Playlist> a, List<Playlist> b)
+        {
+            if (a == null || b == null || a.Count != b.Count) return false;
+            for (int i = 0; i < a.Count; i++)
+            {
+                Playlist x = a[i], y = b[i];
+                if (x.Id != y.Id || (x.Name ?? "") != (y.Name ?? "") || (x.Owner ?? "") != (y.Owner ?? "") ||
+                    (x.ImageUrl ?? "") != (y.ImageUrl ?? "") || (x.Color ?? "") != (y.Color ?? "")) return false;
+            }
+            return true;
         }
 
         /// <summary>Applies the playlist order you set by dragging. Playlists it hasn't seen yet go on top, in Spotify's order.</summary>
@@ -1163,12 +1188,76 @@ namespace Spotipaq
         {
             int generation = ++_pageGeneration;
             ShowLoading(what);
-            Async.Run(this, work, delegate (T result, Exception err)
+            long asked = Spotipaq.Engine.LoadTimer.Now;
+            // timed, for the log: one line saying where the loading time went (see LoadTimer), one when it showed
+            Async.Run<T>(this, delegate
+            {
+                Spotipaq.Engine.LoadTimer timer = Spotipaq.Engine.LoadTimer.Start(what);
+                bool ok = false;
+                try { T loaded = work(); ok = loaded != null; return loaded; }
+                finally { timer.Finish(ok); }
+            }, delegate (T result, Exception err)
             {
                 if (generation != _pageGeneration) return;
                 if (result == null) ShowError(err);
-                else build(result, null);
+                else
+                {
+                    long b = Spotipaq.Engine.LoadTimer.Now;
+                    build(result, null);
+                    Spotipaq.Engine.Log.Write("Showed " + what + " " + (int)Spotipaq.Engine.LoadTimer.Ms(asked) + " ms after it was asked for (page built in " +
+                        (int)Spotipaq.Engine.LoadTimer.Ms(b) + " ms)");
+                }
             });
+        }
+
+        /// <summary>
+        /// A playlist page. Opened before (and not one made for the user, which isn't saved): shown at once as it was
+        /// saved, then the current version is fetched in the background and swapped in, in place, only if it changed.
+        /// Otherwise the usual "Loading playlist..." load.
+        /// </summary>
+        void ShowPlaylist(string id)
+        {
+            int generation = ++_pageGeneration;
+            long asked = Spotipaq.Engine.LoadTimer.Now;
+            Async.Run<Playlist>(this, delegate { return _backend.GetCachedPlaylist(id); }, delegate (Playlist saved, Exception err)
+            {
+                if (generation != _pageGeneration) return;            // gone elsewhere meanwhile
+                if (saved == null)
+                {
+                    LoadPage("playlist", delegate { return _backend.GetPlaylist(id); },
+                        delegate (Playlist r, Exception e) { _page.SetBlocks(PlaylistPage(r)); PlayLinkedPage("playlist", id, r.Tracks); });
+                    return;
+                }
+                _page.SetBlocks(PlaylistPage(saved));
+                PlayLinkedPage("playlist", id, saved.Tracks);
+                Spotipaq.Engine.Log.Write("Showed playlist \"" + saved.Name + "\" as saved, " + (int)Spotipaq.Engine.LoadTimer.Ms(asked) + " ms after it was asked for");
+                // the current version, in the background
+                Async.Run<Playlist>(this, delegate
+                {
+                    Spotipaq.Engine.LoadTimer timer = Spotipaq.Engine.LoadTimer.Start("playlist check");
+                    bool ok = false;
+                    try { Playlist current = _backend.GetPlaylist(id); ok = current != null; return current; }
+                    finally { timer.Finish(ok); }
+                }, delegate (Playlist current, Exception e)
+                {
+                    if (generation != _pageGeneration || current == null) return;        // elsewhere now, or it failed: keep the saved one
+                    if (SameVersion(saved, current)) { Spotipaq.Engine.Log.Write("Playlist unchanged since saved"); return; }
+                    if (_page.SearchInUse) { Spotipaq.Engine.Log.Write("Playlist changed; not swapped in while it is being searched"); return; }
+                    Spotipaq.Engine.Log.Write("Playlist changed since saved: showing the current version");
+                    _page.SetBlocks(PlaylistPage(current), true);
+                });
+            });
+        }
+
+        /// <summary>Whether two versions of a playlist show the same thing: the same revision, or else the same name,
+        /// description, picture and songs in the same order.</summary>
+        static bool SameVersion(Playlist a, Playlist b)
+        {
+            if (!String.IsNullOrEmpty(a.Revision) && a.Revision == b.Revision) return true;
+            if (a.Name != b.Name || a.Description != b.Description || a.ImageUrl != b.ImageUrl || a.HeaderImageUrl != b.HeaderImageUrl ||
+                a.Tracks.Count != b.Tracks.Count) return false;
+            for (int i = 0; i < a.Tracks.Count; i++) if (a.Tracks[i].Id != b.Tracks[i].Id) return false;
+            return true;
         }
 
         void ShowPage(NavTarget t)
@@ -1179,7 +1268,7 @@ namespace Spotipaq
                 case PageKind.Search: LoadPage("results", delegate { return _backend.Search(t.Id); }, delegate (SearchResults r, Exception e) { _page.SetBlocks(SearchPage(r)); }); break;
                 case PageKind.Album: LoadPage("album", delegate { return _backend.GetAlbum(t.Id); }, delegate (Album r, Exception e) { _page.SetBlocks(AlbumPage(r)); PlayLinkedPage("album", t.Id, r.Tracks); }); break;
                 case PageKind.Artist: LoadPage("artist", delegate { return _backend.GetArtist(t.Id); }, delegate (ArtistPage r, Exception e) { _page.SetBlocks(ArtistPageBlocks(r)); PlayLinkedPage("artist", t.Id, r.Popular); }); break;
-                case PageKind.Playlist: LoadPage("playlist", delegate { return _backend.GetPlaylist(t.Id); }, delegate (Playlist r, Exception e) { _page.SetBlocks(PlaylistPage(r)); PlayLinkedPage("playlist", t.Id, r.Tracks); }); break;
+                case PageKind.Playlist: ShowPlaylist(t.Id); break;
                 case PageKind.Songs: LoadPage("songs", delegate { return _backend.GetSavedTracks(); }, delegate (List<Track> r, Exception e) { _page.SetBlocks(SongsPage(r)); }); break;
                 case PageKind.Albums: LoadPage("albums", delegate { return _backend.GetSavedAlbums(); }, delegate (List<Album> r, Exception e) { _page.SetBlocks(AlbumsPage(r)); }); break;
                 case PageKind.Artists: LoadPage("artists", delegate { return _backend.GetFollowedArtists(); }, delegate (List<Artist> r, Exception e) { _page.SetBlocks(ArtistsPage(r)); }); break;

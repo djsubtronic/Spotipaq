@@ -75,6 +75,22 @@ namespace Spotipaq
         public virtual void PaintAnimated(Graphics g, Rectangle r, PageView view) { Paint(g, r, view); }
         /// <summary>The solid colour behind AnimatedRect (a selected row's highlight); Empty = the page's own background.</summary>
         public virtual Color AnimatedBack(PageView view) { return Color.Empty; }
+        /// <summary>Frees anything the block keeps drawn in advance (see TrackListBlock's row pictures). Called when
+        /// the page is replaced or laid out again; the block draws it afresh when next painted.</summary>
+        public virtual void DropCache() { }
+        /// <summary>The part of the block (block coordinates; may start above it, see Bleed) whose look follows the scroll
+        /// position until the top bar is solid - a header dimming into the bar's colour. Repainted on every scroll
+        /// step while that lasts, rather than moved. Empty = none.</summary>
+        public virtual Rectangle ScrollLinked { get { return Rectangle.Empty; } }
+        /// <summary>For a page's header block: the title and play button the top bar shows (as on Spotify) once the
+        /// block's own play button has scrolled up under the bar - StickyFrom is that button's bottom edge, in block
+        /// coordinates. Null title = nothing to show.</summary>
+        public virtual string StickyTitle { get { return null; } }
+        public virtual PageButton StickyButton { get { return null; } }
+        public virtual int StickyFrom { get { return 0; } }
+        /// <summary>Screen rows (Top / Height; r = the block's screen bounds) this paint will cover completely,
+        /// right across the page, with opaque pixels - the page then skips painting its background there.</summary>
+        public virtual Rectangle OpaqueRows(Rectangle r, PageView view) { return Rectangle.Empty; }
     }
 
     /// <summary>
@@ -184,7 +200,19 @@ namespace Spotipaq
         {
             if (SearchShown && SearchRect.Contains(p)) return 4;      // wherever the box currently is, in the bar or below it
             if (p.Y >= HeaderH) return 0;
+            if (Sticky() != null && StickyPlayRect.Contains(p)) return 5;
             return BackRect.Contains(p) ? 1 : ForwardRect.Contains(p) ? 2 : UserRect.Contains(p) ? 3 : -1;
+        }
+
+        // ---- once the page's own play button has scrolled up under the top bar, the bar shows a play button and the
+        // page's title beside back / forward (as on Spotify)
+        const int StickyD = 32;
+        Rectangle StickyPlayRect { get { return new Rectangle(ForwardRect.Right + 10, (HeaderH - StickyD) / 2, StickyD, StickyD); } }
+        Block Sticky()
+        {
+            foreach (Block b in _blocks)
+                if (b.StickyTitle != null && b.StickyButton != null && _scroll >= b.Top + b.StickyFrom - HeaderH) return b;
+            return null;
         }
 
         // ---- the page's key colour, taken from its cover art: a gradient behind the top of the page (drawn once
@@ -195,13 +223,18 @@ namespace Spotipaq
         Color _key;
         Bitmap _grad;
 
-        void DropGradient() { if (_grad != null) { _grad.Dispose(); _grad = null; } _gradColumn = null; }
+        void DropGradient() { if (_grad != null) { _grad.Dispose(); _grad = null; } _gradColumn = null; _washVersion++; }
+
+        /// <summary>Changes whenever the page's background (the colour wash) does: what blocks drew over it in advance
+        /// must then be drawn again.</summary>
+        public int WashVersion { get { return _washVersion; } }
+        int _washVersion;
 
         // ---- "Search in playlist", on pages whose track list asks for one (Block.WantsSearch). It sits in the row the
         // list leaves free above its column headers and scrolls with the page - until it reaches the top bar, where it
         // stays, docked beside the profile button (same x all along, so it only ever moves straight up). The text box
         // itself only exists on screen while it is being typed in or holds text; otherwise just the frame is drawn.
-        readonly TextBox _input = new TextBox();
+        readonly System.Windows.Forms.TextBox _input = new System.Windows.Forms.TextBox();
         Block _inputOwner, _searchBlock;
         bool _inputWanted, _inputQuiet;
         public bool InputFocused { get { return _input.Focused; } }
@@ -227,6 +260,23 @@ namespace Spotipaq
         bool SearchHasText { get { return _searchBlock != null && InputText(_searchBlock).Length > 0; } }
 
         int HeaderAlpha { get { return _scroll <= 0 ? 0 : _scroll >= _solidAt ? 255 : (int)(255L * _scroll / _solidAt); } }
+
+        /// <summary>How far the page is scrolled, in pixels.</summary>
+        public int ScrollY { get { return _scroll; } }
+
+        /// <summary>When g paints into the page's off-screen copy: its pixels (24-bit B,G,R, top row first), for
+        /// native code to draw into directly; size = the copy's size. False otherwise.</summary>
+        public bool CopyBits(Graphics g, out IntPtr bits, out int stride, out Size size)
+        {
+            bits = IntPtr.Zero; stride = 0; size = ClientSize;
+            if (!_copy.Owns(g)) return false;
+            bits = _copy.Bits(out stride);
+            return bits != IntPtr.Zero;
+        }
+        /// <summary>How solid the top bar is right now (0 clear - 255 solid), and its colour: a header dims into that
+        /// colour at the same rate, so the two meet without a seam.</summary>
+        public int HeaderFade { get { return HeaderAlpha; } }
+        public Color HeaderTint { get { return HeaderColor; } }
         Color HeaderColor { get { return !_haveKey ? Color.FromArgb(32, 32, 32) : Modern ? Shade(_key, 40) : Shade(_key, 69); } }
 
         /// <summary>The colour of the search box: what is behind it (the gradient, under however much of the bar has
@@ -379,9 +429,18 @@ namespace Spotipaq
         void PaintGradient(Graphics g)
         {
             if (!_haveKey) return;
+            int gh = Modern ? WashTop + WashH : GradH;
+            if (_scroll >= gh) return;
+            EnsureGradient();
+            FillWashRows(g, new Rectangle(0, 0, ClientSize.Width, gh - _scroll), _scroll, 0, Theme.Main);      // see FillWashRows
+        }
+
+        /// <summary>(Re)builds the gradient bitmap for the current width, if the page has a key colour.</summary>
+        void EnsureGradient()
+        {
+            if (!_haveKey) return;
             bool modern = Modern;
             int top = WashTop, gh = modern ? top + WashH : GradH;
-            if (_scroll >= gh) return;
             int w = Math.Max(64, (ClientSize.Width + 63) / 64 * 64);      // 64 px steps: resizing doesn't rebuild it every pixel
             if (_grad == null || _grad.Width != w || _grad.Height != gh)
             {
@@ -397,25 +456,72 @@ namespace Spotipaq
                     }
                 }
             }
-            // opaque and unscaled: a straight copy, no blending or filtering
-            CompositingMode cm = g.CompositingMode; InterpolationMode im = g.InterpolationMode;
-            g.CompositingMode = CompositingMode.SourceCopy; g.InterpolationMode = InterpolationMode.NearestNeighbor;
-            g.DrawImage(_grad, 0, -_scroll, _grad.Width, _grad.Height);
-            g.CompositingMode = cm; g.InterpolationMode = im;
+        }
+
+        /// <summary>Paints dst (in g's own coordinates, e.g. a bitmap a block draws a row into) with the page's
+        /// background as it is at content row contentY and below - the same pixels the page itself shows there.</summary>
+        public void PaintBackdrop(Graphics g, Rectangle dst, int contentY)
+        {
+            FillWashRows(g, dst, contentY, 0, Theme.Main);
+        }
+
+        /// <summary>
+        /// Fills dst (in g's coordinates, within g's clip) with the page's background as it is from content row
+        /// contentTop down - the colour wash, then the plain page colour - faded alpha/255 of the way to tint.
+        /// Every row of the wash is one colour, so this is plain GDI fills, one per run of equal rows. Drawing the
+        /// wash's bitmap instead cost tens of milliseconds per paint on the Pentium II, however small the area:
+        /// GDI+ processes the whole picture each time.
+        /// </summary>
+        public void FillWashRows(Graphics g, Rectangle dst, int contentTop, int alpha, Color tint)
+        {
+            Rectangle a = Rectangle.Intersect(dst, Rectangle.Round(g.ClipBounds));   // plain GDI ignores g's clip
+            if (a.Width <= 0 || a.Height <= 0) return;
+            EnsureGradient();
+            IntPtr dc = g.GetHdc();
+            try
+            {
+                IntPtr brush = GetStockObject(DC_BRUSH);
+                int y = a.Top;
+                while (y < a.Bottom)
+                {
+                    Color c = WashDimmed(contentTop + y - dst.Top, alpha, tint);
+                    int end = y + 1;
+                    while (end < a.Bottom && WashDimmed(contentTop + end - dst.Top, alpha, tint) == c) end++;
+                    SetDCBrushColor(dc, ColorTranslator.ToWin32(c));
+                    RECT r;
+                    r.Left = a.Left; r.Right = a.Right; r.Top = y; r.Bottom = end;
+                    FillRect(dc, ref r, brush);
+                    y = end;
+                }
+            }
+            finally { g.ReleaseHdc(dc); }
+        }
+
+        Color WashDimmed(int contentY, int alpha, Color tint)
+        {
+            Color under = WashColour(contentY);
+            if (alpha <= 0) return under;
+            return Color.FromArgb(under.R + (tint.R - under.R) * alpha / 255,
+                under.G + (tint.G - under.G) * alpha / 255, under.B + (tint.B - under.B) * alpha / 255);
+        }
+
+        /// <summary>The page's background colour at content row y: the wash, or the plain page colour.</summary>
+        Color WashColour(int contentY)
+        {
+            if (!_haveKey || _grad == null) return Theme.Main;
+            if (_gradColumn == null || _gradColumn.Length != _grad.Height)
+            {
+                _gradColumn = new Color[_grad.Height];
+                for (int i = 0; i < _gradColumn.Length; i++) _gradColumn[i] = _grad.GetPixel(0, i);
+            }
+            return contentY >= 0 && contentY < _gradColumn.Length ? _gradColumn[contentY] : Theme.Main;
         }
         /// <summary>Paints a strip of the control with exactly what the page's background is there right now - the
         /// colour wash at the current scroll position, or the plain page colour past it. For things pinned over the
         /// scrolling content (the column headers): they hide the rows passing behind without showing as a bar.</summary>
         public void FillWash(Graphics g, Rectangle r)
         {
-            using (SolidBrush b = new SolidBrush(Theme.Main)) g.FillRectangle(b, r);
-            int sy = r.Top + _scroll;
-            if (!_haveKey || _grad == null || sy >= _grad.Height || sy < 0) return;
-            int h = Math.Min(r.Height, _grad.Height - sy), w = Math.Min(r.Width, _grad.Width);
-            CompositingMode cm = g.CompositingMode; InterpolationMode im = g.InterpolationMode;
-            g.CompositingMode = CompositingMode.SourceCopy; g.InterpolationMode = InterpolationMode.NearestNeighbor;
-            g.DrawImage(_grad, new Rectangle(r.Left, r.Top, w, h), new Rectangle(r.Left, sy, w, h), GraphicsUnit.Pixel);
-            g.CompositingMode = cm; g.InterpolationMode = im;
+            FillWashRows(g, r, r.Top + _scroll, 0, Theme.Main);
         }
         static void Fade(Graphics g, int y, int h, int w, Color from, Color to)
         {
@@ -443,10 +549,20 @@ namespace Spotipaq
                 g.DrawArc(p, cx - 5.5f, cy + 1, 11, 10, 180, 180);         // shoulders
             }
             g.SmoothingMode = SmoothingMode.None;
+            Block sticky = Sticky();
+            if (sticky != null)
+            {
+                Rectangle play = StickyPlayRect;
+                sticky.StickyButton.Paint(g, play, _hdrHot == 5);          // the same green button (grows a pixel under the pointer)
+                // the title, up to the search box when it is docked in the bar, else the profile button
+                int right = (SearchShown && SearchRect.Top < HeaderH ? SearchRect.Left : UserRect.Left) - 12, x = play.Right + 12;
+                if (right > x) Theme.Text1(g, sticky.StickyTitle, Theme.BarTitle, new Rectangle(x, 0, right - x, HeaderH), Theme.Text);
+            }
         }
 
         static void RoundButton(Graphics g, Rectangle r, bool hot)
         {
+            if (hot) r.Inflate(1, 1);                  // grows a pixel under the pointer, like the play buttons
             using (SolidBrush b = new SolidBrush(Color.FromArgb(hot ? 210 : 150, 0, 0, 0))) g.FillEllipse(b, r);
         }
 
@@ -465,13 +581,17 @@ namespace Spotipaq
         public PageView(IPageHost host)
         {
             _host = host;
-            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer |
+            // no OptimizedDoubleBuffer: the page keeps its own off-screen copy (_copy), which also serves as the buffer
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint |
                      ControlStyles.ResizeRedraw | ControlStyles.Selectable, true);
+            SetStyle(ControlStyles.OptimizedDoubleBuffer, false);
+            _copy = new ScrollBuffer(this);
             BackColor = Theme.Main;
             ForeColor = Theme.Text;
             _bar = new SlimScroll(this, delegate { return _scroll; }, delegate { return MaxScroll; },
-                delegate (int v) { _scroll = v; ClampScroll(); }, 80,
+                delegate (int v) { ScrollTo(v); }, 80,
                 Color.Transparent, Color.FromArgb(90, 90, 90), Color.FromArgb(150, 150, 150));      // no track: the page shows through
+            _bar.OwnerRepaints = true;                 // ScrollTo moves the pixels and repaints the bar itself
             SetUpInput();
             _bar.TopInset = HeaderH;                   // the up arrow starts just under the header...
             _bar.BottomInset = Theme.CardRadius;       // ...and the down arrow ends where the bottom corner starts to curve
@@ -531,11 +651,23 @@ namespace Spotipaq
             bool same = true;
             for (int i = 0; i < Equalizer.Count; i++) if (_eqNow[i] != was[i]) { same = false; break; }
             if (same) return;
-            int x, bottom;
-            Equalizer.Place(cell, out x, out bottom);
             IntPtr dc = GetDC(Handle);
             if (dc == IntPtr.Zero) return;
-            try
+            try { DrawBars(dc, cell, back, was); }
+            finally { ReleaseDC(Handle, dc); }
+            // the page's off-screen copy has to show the same, or scrolling would bring back old bars
+            IntPtr copy = _copy.GetHdc();
+            if (copy != IntPtr.Zero)
+                try { DrawBars(copy, cell, back, was); }
+                finally { _copy.ReleaseHdc(copy); }
+            Array.Copy(_eqNow, was, Equalizer.Count);
+        }
+
+        // the bars' changes since "was" (the heights on screen), onto a device context
+        void DrawBars(IntPtr dc, Rectangle cell, Color back, int[] was)
+        {
+            int x, bottom;
+            Equalizer.Place(cell, out x, out bottom);
             {
                 IntPtr brush = GetStockObject(DC_BRUSH);
                 int green = ColorTranslator.ToWin32(Theme.Accent);
@@ -561,10 +693,17 @@ namespace Spotipaq
                                 Fill(dc, brush, bx, y, y + 1);
                             }
                     }
-                    was[i] = h;
                 }
             }
-            finally { ReleaseDC(Handle, dc); }
+        }
+
+        /// <summary>Paints screen rows screenTop..screenBottom, right across the page (within g's clip), with the page's
+        /// background (the colour wash) faded alpha/255 of the way to tint - the same result as a see-through fill over
+        /// the wash, with no blending (see FillWashRows).</summary>
+        public void PaintDimmedWash(Graphics g, int screenTop, int screenBottom, int alpha, Color tint)
+        {
+            if (screenBottom <= screenTop) return;
+            FillWashRows(g, new Rectangle(0, screenTop, ClientSize.Width, screenBottom - screenTop), screenTop + _scroll, alpha, tint);
         }
 
         static void Fill(IntPtr dc, IntPtr brush, int x, int top, int bottom)
@@ -575,29 +714,32 @@ namespace Spotipaq
         }
 
         // is screen row y over the page's gradient (see PaintGradient)?
-        bool InGradient(int y) { return _haveKey && _grad != null && y + _scroll < _grad.Height; }
+        bool InGradient(int y) { return _haveKey && _grad != null && y + _scroll >= 0 && y + _scroll < _grad.Height; }
 
-        Color GradientAt(int y)
-        {
-            if (_gradColumn == null || _gradColumn.Length != _grad.Height)
-            {
-                _gradColumn = new Color[_grad.Height];
-                for (int i = 0; i < _gradColumn.Length; i++) _gradColumn[i] = _grad.GetPixel(0, i);
-            }
-            int gy = y + _scroll;
-            return gy >= 0 && gy < _gradColumn.Length ? _gradColumn[gy] : Theme.Main;
-        }
+        Color GradientAt(int y) { return WashColour(y + _scroll); }
 
         protected override void Dispose(bool disposing)
         {
-            if (disposing) _eqTimer.Dispose();
+            if (disposing)
+            {
+                _eqTimer.Dispose(); _copy.Dispose();
+                foreach (Block b in _blocks) b.DropCache();
+            }
             base.Dispose(disposing);
         }
 
         public IPageHost Host { get { return _host; } }
 
-        public void SetBlocks(IList<Block> blocks)
+        public void SetBlocks(IList<Block> blocks) { SetBlocks(blocks, false); }
+
+        /// <summary>True while the page's search box is open or holds text (a filter is being used).</summary>
+        public bool SearchInUse { get { return _inputWanted || _input.Text.Length > 0; } }
+
+        /// <summary>keepScroll: the same page, updated (a playlist that changed since it was saved): stays where it
+        /// was scrolled to, as far as the new content allows.</summary>
+        public void SetBlocks(IList<Block> blocks, bool keepScroll)
         {
+            foreach (Block b in _blocks) b.DropCache();
             _blocks.Clear();
             _blocks.AddRange(blocks);
             string url = null;
@@ -610,13 +752,18 @@ namespace Spotipaq
             foreach (Block b in _blocks) if (b.WantsSearch) { _searchBlock = b; break; }
             _inputQuiet = true; _input.Text = ""; _inputQuiet = false;
             if (_input.Visible) _input.Visible = false;
-            _scroll = 0;
+            if (!keepScroll) _scroll = 0;           // (kept: EnsureLayout clamps it to the new content)
             _hot = null;
             _layoutWidth = -1;
             Invalidate();
         }
 
-        public void Relayout() { _layoutWidth = -1; Invalidate(); }
+        public void Relayout() { _layoutWidth = -1; DropCaches(); Invalidate(); }
+
+        /// <summary>Repaints the whole page with nothing reused from before (e.g. emoji pictures have just arrived).</summary>
+        public void Redraw() { DropCaches(); Invalidate(); }
+
+        void DropCaches() { foreach (Block b in _blocks) b.DropCache(); }
 
         void EnsureLayout()
         {
@@ -635,7 +782,99 @@ namespace Spotipaq
         int MaxScroll { get { return Math.Max(0, _contentHeight - ClientSize.Height); } }
         void ClampScroll() { _scroll = Math.Max(0, Math.Min(_scroll, MaxScroll)); }
 
-        public void ScrollBy(int dy) { _scroll += dy; ClampScroll(); Invalidate(); }
+        public void ScrollBy(int dy) { ScrollTo(_scroll + dy); }
+
+        // ---- scrolling. Instead of repainting the whole page on every step (every row's text, the artwork, the
+        // header...), the pixels already on screen are moved (PixelScroll) and only what that can't cover is painted:
+        // the strip that comes into view, plus the parts that stay put while the page moves under them - the top bar
+        // (it fades in with the scroll), the pinned column headers, the search box, the scrollbar and the rounded
+        // bottom corners. The picture ends up exactly as a full repaint would draw it.
+        int _scrolledAt;                       // Environment.TickCount of the last step (0 = none yet)
+
+        /// <summary>True while the page is being scrolled (and briefly after): repaints that can wait, should.</summary>
+        public bool Scrolling { get { return _scrolledAt != 0 && unchecked(Environment.TickCount - _scrolledAt) < 250; } }
+
+        void ScrollTo(int target)
+        {
+            if (IsHandleCreated) Update();     // anything already waiting is painted at the old position first
+            EnsureLayout();
+            int old = _scroll;
+            Block pinWas = Pinned();
+            Rectangle searchWas = SearchShown ? SearchRect : Rectangle.Empty;
+            _scroll = target;
+            ClampScroll();
+            int dy = _scroll - old;
+            if (dy == 0) return;
+            _scrolledAt = Environment.TickCount;
+            if (_scrolledAt == 0) _scrolledAt = 1;
+            _eqBlock = null;
+            Block pinNow = Pinned();
+            int pinH = Math.Max(pinWas != null ? pinWas.PinHeight : 0, pinNow != null ? pinNow.PinHeight : 0);
+            int w = ClientSize.Width, h = ClientSize.Height;
+            int top = Math.Min(h, HeaderH + pinH), bottom = Math.Max(top, h - Theme.CardRadius);
+            Rectangle area = new Rectangle(0, top, Math.Max(0, w - BarW), bottom - top);
+            // A header that dims (and zooms) with the scroll: its part in view is repainted, not moved, until the
+            // top bar is solid - from then on it is the bar's plain colour and moves like the rest. So the pixels that
+            // move (in the copy and on screen) start below it: moving it too would be wasted work, and on screen it
+            // would show for a moment before its new picture arrived - the banner jumping and coming back. Below
+            // means below where it ends before or after this step, whichever is higher: what comes into view under
+            // it is then the header's own new rows.
+            List<Rectangle> parts = new List<Rectangle>();
+            Rectangle move = area;
+            if (old < _solidAt || _scroll < _solidAt)
+                foreach (Block b in _blocks)
+                {
+                    Rectangle linked = b.ScrollLinked;
+                    if (linked.IsEmpty) continue;
+                    Rectangle band = new Rectangle(0, top, w, bottom - top);
+                    Rectangle now = new Rectangle(0, b.Top - _scroll + linked.Top, w, linked.Height);
+                    Rectangle was = new Rectangle(0, b.Top - old + linked.Top, w, linked.Height);
+                    now.Intersect(band); was.Intersect(band);
+                    if (now.Height > 0) parts.Add(now);
+                    int under = Math.Min(now.Height > 0 ? now.Bottom : top, was.Height > 0 ? was.Bottom : top);
+                    if ((now.Height > 0 && now.Top <= move.Top) || (was.Height > 0 && was.Top <= move.Top))
+                        if (under > move.Top) move = new Rectangle(area.Left, under, area.Width, Math.Max(0, area.Bottom - under));
+                }
+            // all the work happens in the page's off-screen copy; the screen only gets the finished step
+            if (!_copy.Shift(move, dy))
+            {
+                Equalizer.ShownCell = Rectangle.Empty;
+                Invalidate();
+                Update();
+                return;
+            }
+            // the playing song's bars moved with everything else (still known on screen if they stayed inside the area)
+            Rectangle cell = Equalizer.ShownCell;
+            if (!cell.IsEmpty)
+            {
+                Rectangle moved = cell;
+                moved.Offset(0, -dy);
+                Equalizer.ShownCell = move.Contains(cell) && move.Contains(moved) ? moved : Rectangle.Empty;
+            }
+            // What has to be painted afresh (everything else was moved):
+            parts.Add(dy > 0 ? new Rectangle(0, move.Bottom - dy, w, dy)          // the strip that came into view
+                             : new Rectangle(0, move.Top, w, -dy));
+            parts.Add(new Rectangle(0, 0, w, top));                             // top bar, pinned headers, top corners
+            parts.Add(new Rectangle(area.Right, top, w - area.Right, bottom - top));     // the scrollbar's strip
+            parts.Add(new Rectangle(0, bottom, w, h - bottom));                 // bottom corners
+            if (!searchWas.IsEmpty)
+            {
+                searchWas.Offset(0, -dy);      // where the shift took the box's old picture (it may have docked since)
+                parts.Add(searchWas);
+            }
+            if (SearchShown) parts.Add(SearchRect);
+            // ...as few paints as possible (each one re-runs everything under it), into the copy; then the screen
+            // moves its own pixels and takes just these pieces from the copy
+            List<Rectangle> pieces = ScrollBuffer.Coalesce(parts, ClientSize);
+            ClipPainter paint = PaintPage;
+            foreach (Rectangle p in pieces) _copy.Draw(p, paint);
+            _copy.PresentScrolled(move, dy, pieces);
+        }
+
+        // the page keeps its own off-screen copy of what it shows (see ScrollBuffer): every paint goes through it
+        readonly ScrollBuffer _copy;
+
+        protected override void OnPaintBackground(PaintEventArgs e) { }        // OnPaint covers everything
 
         protected override void OnPaint(PaintEventArgs e)
         {
@@ -643,24 +882,33 @@ namespace Spotipaq
             // bars only - not the whole row (its cover, text) and the page's overlays, 20 times a second.
             Block eq = _eqBlock;
             _eqBlock = null;
-            if (eq != null && e.ClipRectangle == _eqRect && _blocks.Contains(eq))
+            if (eq != null && e.ClipRectangle == _eqRect && _blocks.Contains(eq) && _copy.Ready)
             {
                 Equalizer.ShownCell = Rectangle.Empty;
-                e.Graphics.Clear(Theme.Main);
-                PaintGradient(e.Graphics);
-                eq.PaintAnimated(e.Graphics, new Rectangle(0, eq.Top - _scroll, _layoutWidth, eq.Height), this);
+                _copy.Paint(e.Graphics, e.ClipRectangle, delegate (Graphics qg, Rectangle qclip)
+                {
+                    qg.Clear(Theme.Main);
+                    PaintGradient(qg);
+                    eq.PaintAnimated(qg, new Rectangle(0, eq.Top - _scroll, _layoutWidth, eq.Height), this);
+                });
                 return;
             }
+            if (!_copy.Paint(e.Graphics, e.ClipRectangle, PaintPage)) PaintPage(e.Graphics, e.ClipRectangle);
+        }
+
+        /// <summary>Paints the part of the page inside clip (client coordinates) with g.</summary>
+        void PaintPage(Graphics g, Rectangle clip)
+        {
             // whatever this paint puts over the bars' cell, the next frame can't assume what is there (Equalizer.Draw
             // notes it again if it draws them)
-            if (!Equalizer.ShownCell.IsEmpty && e.ClipRectangle.IntersectsWith(Equalizer.ShownCell)) Equalizer.ShownCell = Rectangle.Empty;
+            if (!Equalizer.ShownCell.IsEmpty && clip.IntersectsWith(Equalizer.ShownCell)) Equalizer.ShownCell = Rectangle.Empty;
             EnsureLayout();
-            Graphics g = e.Graphics;
-            g.Clear(Theme.Main);
+            bool hadKey = _haveKey;
             EnsureKey();
+            // the colour has only just been worked out, during a paint of part of the page: the rest needs it too
+            if (_haveKey && !hadKey && clip != ClientRectangle) Invalidate();
             SyncInput();
-            PaintGradient(g);
-            Rectangle clip = e.ClipRectangle;
+            PaintBackground(g, clip);
             foreach (Block b in _blocks)
             {
                 Rectangle r = new Rectangle(0, b.Top - _scroll, _layoutWidth, b.Height);
@@ -674,6 +922,31 @@ namespace Spotipaq
             PaintSearch(g);         // over the bar when docked
             _bar.Paint(g);          // thin scrollbar (Spotify-style), only when needed
             Theme.CardCorners(g, ClientRectangle, Theme.CardRadius, Theme.Window);      // the page is a rounded card
+        }
+
+        /// <summary>The page's background (its colour wash, then the plain page colour) in clip - except rows a block
+        /// is about to cover completely anyway (a header's banner): painting under those was wasted work.</summary>
+        void PaintBackground(Graphics g, Rectangle clip)
+        {
+            List<Rectangle> covered = new List<Rectangle>();
+            foreach (Block b in _blocks)
+            {
+                Rectangle r = new Rectangle(0, b.Top - _scroll, _layoutWidth, b.Height);
+                if (r.Bottom < clip.Top || r.Top - b.Bleed > clip.Bottom) continue;
+                Rectangle o = b.OpaqueRows(r, this);
+                if (o.Height > 0) covered.Add(o);
+            }
+            int w = ClientSize.Width, y = clip.Top;
+            while (y < clip.Bottom)
+            {
+                bool skip = false;
+                foreach (Rectangle o in covered) if (y >= o.Top && y < o.Bottom) { y = o.Bottom; skip = true; break; }
+                if (skip) continue;
+                int end = clip.Bottom;
+                foreach (Rectangle o in covered) if (o.Top > y && o.Top < end) end = o.Top;
+                FillWashRows(g, new Rectangle(0, y, w, end - y), y + _scroll, 0, Theme.Main);
+                y = end;
+            }
         }
 
         Block BlockAt(int contentY, out Point local, int x)
@@ -756,6 +1029,11 @@ namespace Spotipaq
                 if (hh == 1 && CanBack && Back != null) Back(this, EventArgs.Empty);
                 else if (hh == 2 && CanForward && Forward != null) Forward(this, EventArgs.Empty);
                 else if (hh == 3 && UserMenu != null) UserMenu.Show(this, new Point(UserRect.Right, UserRect.Bottom + 4), ToolStripDropDownDirection.BelowLeft);
+                else if (hh == 5)
+                {
+                    Block sb = Sticky();
+                    if (sb != null && sb.StickyButton.Action != null) sb.StickyButton.Action(this, EventArgs.Empty);
+                }
                 else if (hh == 4)
                 {
                     if (e.X >= SearchRect.Right - 26 && SearchHasText) ClearInput(_searchBlock);      // the X
@@ -793,7 +1071,7 @@ namespace Spotipaq
             {
                 LeaveHot();
                 if (hh == 4) Cursor = e.X >= SearchRect.Right - 26 && SearchHasText ? Cursors.Hand : Cursors.IBeam;      // a text field, except over its X
-                else Cursor = hh == 3 || (hh == 1 && CanBack) || (hh == 2 && CanForward) ? Cursors.Hand : Cursors.Default;
+                else Cursor = hh == 3 || hh == 5 || (hh == 1 && CanBack) || (hh == 2 && CanForward) ? Cursors.Hand : Cursors.Default;
                 return;
             }
             Point local;
@@ -917,6 +1195,36 @@ namespace Spotipaq
         bool Banner { get { return !String.IsNullOrEmpty(BannerUrl); } }
         const int BannerH = 250;                                    // from the very top of the page
         const int BannerBottom = BannerH - PageView.HeaderH;        // in block coordinates (the block starts under the top bar)
+        // As the page scrolls, the banner picture zooms out and holds its place on screen while its box scrolls up
+        // (as on Spotify: measured from its client, the picture barely moves while the box goes). It is fetched this
+        // much bigger than the box, so zoomed out fully it still fills it.
+        const int ZoomPercent = 5;              // the picture shrinks by this much over the header's scroll
+        const int PanPercent = 100;             // how far the picture moves down inside its box, per pixel scrolled
+        /// <summary>The header area that dims as the page scrolls: the banner (from the very top of the page), or the
+        /// coloured area behind the cover and texts.</summary>
+        public override Rectangle ScrollLinked { get { return new Rectangle(0, -Bleed, 1, Bleed + WashTop); } }
+
+        public override Rectangle OpaqueRows(Rectangle r, PageView view)
+        {
+            int a = view.HeaderFade;
+            int dimTop = Math.Max(PageView.HeaderH, r.Top - Bleed), dimBottom = r.Top + WashTop;
+            if (a >= 255 || (!Banner && a > 0))          // PaintDim's opaque fills
+                return dimBottom > dimTop ? new Rectangle(0, dimTop, 1, dimBottom - dimTop) : Rectangle.Empty;
+            if (Banner)
+            {
+                // the banner itself, once its picture is in (the same size PaintBanner asks for)
+                int bw = Math.Max(64, (view.ClientSize.Width + 63) / 64 * 64);
+                int zw = (bw * (100 + ZoomPercent) + 99) / 100, zh = (BannerH * (100 + ZoomPercent) + 99) / 100;
+                if (view.Host.Images.Get(BannerUrl, zw, zh, true) != null)
+                    return new Rectangle(0, r.Top - PageView.HeaderH, 1, BannerH);
+            }
+            return Rectangle.Empty;
+        }
+
+        int PlayIndex { get { for (int i = 0; i < _buttons.Count; i++) if (_buttons[i].Icon == "play") return i; return -1; } }
+        public override string StickyTitle { get { return PlayIndex >= 0 ? _title : null; } }
+        public override PageButton StickyButton { get { int i = PlayIndex; return i >= 0 ? _buttons[i] : null; } }
+        public override int StickyFrom { get { int i = PlayIndex; return i >= 0 ? ButtonRect(i).Bottom : 0; } }
         static readonly Color OnPhoto = Color.FromArgb(228, 228, 228), OnPhotoDim = Color.FromArgb(205, 205, 205);
         public override int Bleed { get { return Banner ? PageView.HeaderH : 0; } }
         public override int WashTop { get { return Banner ? BannerBottom : Art + PadY + 10; } }      // the banner's bottom edge / the header's
@@ -952,10 +1260,21 @@ namespace Spotipaq
         static int TextW(string s, Font f)
         {
             if (String.IsNullOrEmpty(s)) return 0;
-            if (Theme.IsRich(s)) return Theme.Measure(s, f).Width - 4;          // symbols / emoji: laid out by Theme, 2 px either side
-            Size big = new Size(100000, 100);
-            return TextRenderer.MeasureText(s + s, f, big, Plain).Width - TextRenderer.MeasureText(s, f, big, Plain).Width;
+            // measured once per text and font: the header is painted again on every scroll step while it is in view
+            string key = f.Name + "/" + f.Size + "/" + (int)f.Style + "/" + s;
+            int w;
+            if (_widths.TryGetValue(key, out w)) return w;
+            if (Theme.IsRich(s)) w = Theme.Measure(s, f).Width - 4;          // symbols / emoji: laid out by Theme, 2 px either side
+            else
+            {
+                Size big = new Size(100000, 100);
+                w = TextRenderer.MeasureText(s + s, f, big, Plain).Width - TextRenderer.MeasureText(s, f, big, Plain).Width;
+            }
+            if (_widths.Count > 500) _widths.Clear();
+            _widths[key] = w;
+            return w;
         }
+        static readonly Dictionary<string, int> _widths = new Dictionary<string, int>();
         /// <summary>Draws one part of the bottom line at x and returns where the next one starts.</summary>
         static int Part(Graphics g, string s, Font f, int x, int y, int right, Color c)
         {
@@ -981,28 +1300,243 @@ namespace Spotipaq
 
         // The banner: scaled to fill the page's width (centre-cropped by the image cache), from the very top of the
         // page, darkened towards the bottom so the texts stay readable.
-        void PaintBanner(Graphics g, Rectangle r, PageView view)
+        // ---- the banner as one picture (the "frame"): the scaled photo, the fade that keeps the texts readable and the
+        // scroll dimming, put together in GDI+'s own fast pixel format and then copied to the page in one go. Built once
+        // per scroll position - a scroll step repaints the header in several pieces (the header area, the strip under
+        // the top bar, the scrollbar's strip...), and each used to scale the photo and blend the fades again, onto the
+        // screen's 16-bit pixels.
+        Bitmap _frame;                  // GDI+ version (when SpotipaqNative.dll is older than version 3)
+        DibPicture _dib;                // native version: spq_banner draws it, BitBlt copies it
+        bool _frameValid, _frameNative;
+        int _frameW;
+        Image _frameSrc;
+        int _frameScroll = -1, _frameFade = -1;
+        Color _frameTint;
+
+        public override void DropCache()
+        {
+            if (_frame != null) { _frame.Dispose(); _frame = null; }
+            if (_dib != null) { _dib.Dispose(); _dib = null; }
+            _frameSrc = null;
+            _frameValid = false;
+        }
+
+        // ---- the native frame (SpotipaqNative.dll 3+): spq_banner does the zoom, the fade and the dimming in one
+        // integer pass straight into a 24-bit GDI picture. GDI+ needed several passes, each converting every pixel to
+        // its own format and back - 15-50 ms a scroll step on the Pentium II, plus 2-13 ms more to copy the result.
+        [DllImport("SpotipaqNative.dll", CallingConvention = CallingConvention.Cdecl)]
+        static extern int spq_banner(IntPtr src, int srcW, int srcH, int srcStride, IntPtr dst, int dstStride,
+            int x0, int x1, int y0, int y1, int fx0, int fy0, int fstep, int[] keep, int[] add);
+        static int _native = -1;        // -1 not checked yet, 0 no (old DLL or it failed), 1 yes
+        static bool NativeOk
+        {
+            get
+            {
+                // version 4: spq_banner with a column range (MMX). An older DLL's spq_banner takes other arguments,
+                // so it is not called at all: the GDI+ frame is used instead.
+                if (_native < 0) _native = Spotipaq.Engine.Native.Version() >= 4 ? 1 : 0;
+                return _native == 1;
+            }
+        }
+
+        /// <summary>The native version of the banner frame, in a picture of its own (when painting somewhere other
+        /// than the page's off-screen copy, which PaintBanner otherwise draws into directly).</summary>
+        bool BuildFrameNative(Bitmap banner, int bw, int zw, int s, int fade, Color tint)
+        {
+            int from = Math.Min(BannerH, s);           // rows above are off the top of the page
+            if (from >= BannerH) return true;
+            if (_dib == null || _dib.Width != bw || _dib.Height != BannerH)
+            {
+                if (_dib != null) _dib.Dispose();
+                _dib = DibPicture.Create(bw, BannerH);
+                if (_dib == null) return false;
+            }
+            return RunNative(banner, bw, zw, s, fade, tint, _dib.Bits, _dib.Stride, 0, bw, from, BannerH);
+        }
+
+        /// <summary>spq_banner for banner columns x0..x1-1 and rows y0..y1-1 into dst (banner row 0, column 0;
+        /// 24-bit, stride bytes per row).</summary>
+        bool RunNative(Bitmap banner, int bw, int zw, int s, int fade, Color tint, IntPtr dst, int stride, int x0, int x1, int y0, int y1)
+        {
+            if (x1 <= x0 || y1 <= y0) return true;
+            // where the picture sits: the same zoom and pan as BuildFrame (see there)
+            double k, sx;
+            int pan;
+            if (s == 0) { k = 1; sx = (zw - bw) / 2; pan = 0; }
+            else
+            {
+                double t = Math.Min(1.0, s / (double)BannerBottom);
+                double scale = 1.0 - (1.0 - 100.0 / (100 + ZoomPercent)) * t;
+                k = 1.0 / scale;
+                sx = (zw - bw * k) / 2.0;
+                pan = Math.Min(s, s * PanPercent / 100);
+            }
+            int fx0 = (int)Math.Round((sx + 0.5 * k - 0.5) * 65536), fy0 = (int)Math.Round(((0.5 - pan) * k - 0.5) * 65536);
+            int fstep = (int)Math.Round(k * 65536);
+            // each row's overlay, as BuildFrame blends it: the readability fade (black at 20 -> the page colour at
+            // 120 over the banner's height) and, from the top bar's bottom edge down, the scroll dimming
+            int[] keep = new int[BannerH], add = new int[BannerH * 3];
+            int dimTop = Math.Max(Math.Min(BannerH, s), PageView.HeaderH + s);
+            Color m = Theme.Main;
+            for (int y = y0; y < y1; y++)
+            {
+                double t = (y + 0.5) / (BannerH + 1);
+                double a1 = (20 + 100 * t) / 255.0, d = y >= dimTop ? fade / 255.0 : 0;
+                int kf = (int)Math.Round((1 - a1) * (1 - d) * 256), cap = 255 * (256 - kf);
+                keep[y] = kf;
+                add[y * 3 + 0] = Math.Min(cap, (int)Math.Round(256 * (m.B * t * a1 * (1 - d) + tint.B * d)));
+                add[y * 3 + 1] = Math.Min(cap, (int)Math.Round(256 * (m.G * t * a1 * (1 - d) + tint.G * d)));
+                add[y * 3 + 2] = Math.Min(cap, (int)Math.Round(256 * (m.R * t * a1 * (1 - d) + tint.R * d)));
+            }
+            System.Drawing.Imaging.BitmapData bd = banner.LockBits(new Rectangle(0, 0, banner.Width, banner.Height),
+                System.Drawing.Imaging.ImageLockMode.ReadOnly, System.Drawing.Imaging.PixelFormat.Format32bppPArgb);
+            try
+            {
+                return spq_banner(bd.Scan0, bd.Width, bd.Height, bd.Stride, dst, stride,
+                    x0, x1, y0, y1, fx0, fy0, fstep, keep, add) == 1;
+            }
+            catch (Exception) { _native = 0; return false; }      // e.g. an old DLL without spq_banner: GDI+ from now on
+            finally { banner.UnlockBits(bd); }
+        }
+
+        /// <summary>Paints the banner, dimmed for the scroll. False = the dimming is left to PaintDim (no picture yet,
+        /// or fully dimmed, when nothing of the picture shows).</summary>
+        bool PaintBanner(Graphics g, Rectangle r, PageView view)
         {
             // width rounded up to 64px steps, so resizing the window doesn't rescale the banner every pixel
             int bw = Math.Max(64, (view.ClientSize.Width + 63) / 64 * 64), top = r.Top - PageView.HeaderH;
-            Bitmap banner = view.Host.Images.Get(BannerUrl, bw, BannerH, true);      // keep the top of the picture, cut the bottom
-            if (banner != null)
+            int fade = view.HeaderFade;
+            if (fade >= 255) return false;
+            int zw = (bw * (100 + ZoomPercent) + 99) / 100, zh = (BannerH * (100 + ZoomPercent) + 99) / 100;
+            Bitmap banner = view.Host.Images.Get(BannerUrl, zw, zh, true);      // keep the top of the picture, cut the bottom
+            if (banner == null)
             {
-                InterpolationMode im = g.InterpolationMode;
-                g.InterpolationMode = InterpolationMode.NearestNeighbor;            // already the right size
-                g.DrawImage(banner, r.Left, top, bw, BannerH);
-                g.InterpolationMode = im;
+                // still loading: the fade alone over the page's colour, as before
+                using (LinearGradientBrush fb = new LinearGradientBrush(new Rectangle(r.Left, top, bw, BannerH + 1),
+                    Color.FromArgb(0, 0, 0, 0), Color.FromArgb(60, Theme.Main), LinearGradientMode.Vertical))
+                    g.FillRectangle(fb, r.Left, top, bw, BannerH);
+                return false;
             }
-            using (LinearGradientBrush fade = new LinearGradientBrush(new Rectangle(r.Left, top, bw, BannerH + 1),
-                Color.FromArgb(banner != null ? 20 : 0, 0, 0, 0), Color.FromArgb(banner != null ? 120 : 60, Theme.Main), LinearGradientMode.Vertical))
-                g.FillRectangle(fade, r.Left, top, bw, BannerH);
+            int s = Math.Max(0, view.ScrollY);
+            Color tint = view.HeaderTint;
+            // Painting into the page's off-screen copy (scrolling, hover...): the native routine draws just this
+            // paint's part of the banner straight into it - nothing kept, nothing copied afterwards.
+            IntPtr bits; int stride; Size size;
+            if (NativeOk && view.CopyBits(g, out bits, out stride, out size))
+            {
+                Rectangle part = Rectangle.Intersect(Rectangle.Round(g.ClipBounds), new Rectangle(Point.Empty, size));
+                part.Intersect(new Rectangle(r.Left, Math.Max(0, top), bw, top + BannerH - Math.Max(0, top)));
+                // banner row 0, column 0 in the copy (above the copy's top when scrolled; only rows on it are written)
+                IntPtr origin = new IntPtr(bits.ToInt64() + (long)top * stride + (long)r.Left * 3);
+                bool done = part.Width <= 0 || part.Height <= 0 ||
+                    RunNative(banner, bw, zw, s, fade, tint, origin, stride, part.Left - r.Left, part.Right - r.Left, part.Top - top, part.Bottom - top);
+                if (done) return true;
+            }
+            if (!_frameValid || _frameW != bw || _frameSrc != banner || _frameScroll != s || _frameFade != fade || _frameTint != tint)
+            {
+                _frameNative = NativeOk && BuildFrameNative(banner, bw, zw, s, fade, tint);
+                if (!_frameNative) BuildFrame(banner, bw, zw, zh, s, fade, tint);
+                _frameValid = true; _frameW = bw;
+                _frameSrc = banner; _frameScroll = s; _frameFade = fade; _frameTint = tint;
+            }
+            if (_frameNative)
+            {
+                // plain GDI copy of just the part inside this paint
+                Rectangle to = Rectangle.Intersect(new Rectangle(r.Left, top, bw, BannerH), Rectangle.Round(g.ClipBounds));
+                if (to.Width > 0 && to.Height > 0)
+                {
+                    IntPtr dc = g.GetHdc();
+                    try { ScrollBuffer.Copy(dc, to, _dib.Dc, to.X - r.Left, to.Y - top); }
+                    finally { g.ReleaseHdc(dc); }
+                }
+            }
+            else
+            {
+                CompositingMode cm = g.CompositingMode; InterpolationMode im = g.InterpolationMode;
+                g.CompositingMode = CompositingMode.SourceCopy; g.InterpolationMode = InterpolationMode.NearestNeighbor;
+                g.DrawImage(_frame, new Rectangle(r.Left, top, bw, BannerH), 0, 0, bw, BannerH, GraphicsUnit.Pixel);
+                g.CompositingMode = cm; g.InterpolationMode = im;
+            }
+            return true;
+        }
+
+        void BuildFrame(Bitmap banner, int bw, int zw, int zh, int s, int fade, Color tint)
+        {
+            if (_frame == null || _frame.Width != bw || _frame.Height != BannerH)
+            {
+                if (_frame != null) _frame.Dispose();
+                _frame = new Bitmap(bw, BannerH, System.Drawing.Imaging.PixelFormat.Format32bppPArgb);
+            }
+            _frameSrc = banner; _frameScroll = s; _frameFade = fade; _frameTint = tint;
+            using (Graphics fg = Graphics.FromImage(_frame))
+            {
+                // only the rows still on the page (the frame's top is s pixels above the window)
+                int from = Math.Min(BannerH, s);
+                if (from >= BannerH) return;
+                fg.SetClip(new Rectangle(0, from, bw, BannerH - from));
+                fg.CompositingMode = CompositingMode.SourceCopy;
+                if (s == 0)
+                {
+                    // at rest: the middle of the picture at its own size, a straight copy
+                    fg.InterpolationMode = InterpolationMode.NearestNeighbor;
+                    fg.DrawImage(banner, new Rectangle(0, 0, bw, BannerH), new Rectangle((zw - bw) / 2, 0, bw, BannerH), GraphicsUnit.Pixel);
+                }
+                else
+                {
+                    // scrolled: zoomed out by up to ZoomPercent (fully once the banner's bottom reaches the top bar),
+                    // kept centred across, its top edge moved down by the scroll (PanPercent) - the part of the box
+                    // above that is off the top of the page
+                    double t = Math.Min(1.0, s / (double)BannerBottom);
+                    double scale = 1.0 - (1.0 - 100.0 / (100 + ZoomPercent)) * t;      // drawn size / picture size
+                    int pan = Math.Min(s, s * PanPercent / 100), h = BannerH - pan;
+                    if (h > 0)
+                    {
+                        float k = (float)(1.0 / scale);                 // picture pixels per frame pixel
+                        float sw = bw * k, sh = h * k, sx = (zw - sw) / 2f;
+                        fg.InterpolationMode = InterpolationMode.Bilinear;
+                        fg.PixelOffsetMode = PixelOffsetMode.Half;     // lines up with the straight copy at rest
+                        // drawn one pixel bigger all round: the filter's soft outer edge lands outside the frame
+                        fg.DrawImage(banner, new Rectangle(-1, pan - 1, bw + 2, h + 2), sx - k, -k, sw + 2 * k, sh + 2 * k, GraphicsUnit.Pixel);
+                        fg.PixelOffsetMode = PixelOffsetMode.Default;
+                    }
+                }
+                fg.CompositingMode = CompositingMode.SourceOver;
+                // The fade towards the bottom (so the texts stay readable) and, from the top bar's bottom edge down, the
+                // scroll dimming (see PaintDim; the bar does its own strip) - in ONE blend: the two layers' combined
+                // colour and strength at the gradient's ends, so each pixel is blended once instead of twice.
+                Rectangle span = new Rectangle(0, 0, bw, BannerH + 1);
+                Color fadeTop = Color.FromArgb(20, 0, 0, 0), fadeBottom = Color.FromArgb(120, Theme.Main);
+                int dimTop = Math.Max(from, PageView.HeaderH + s);
+                if (dimTop > from)
+                    using (LinearGradientBrush fb = new LinearGradientBrush(span, fadeTop, fadeBottom, LinearGradientMode.Vertical))
+                        fg.FillRectangle(fb, 0, from, bw, Math.Min(BannerH, dimTop) - from);
+                if (dimTop < BannerH)
+                    using (LinearGradientBrush fb = new LinearGradientBrush(span, Under(fadeTop, fade, tint), Under(fadeBottom, fade, tint), LinearGradientMode.Vertical))
+                        fg.FillRectangle(fb, 0, dimTop, bw, BannerH - dimTop);
+            }
+        }
+
+        /// <summary>One see-through colour with the same effect as layer (a see-through colour) followed by tint at
+        /// strength dim (0-255) over it.</summary>
+        static Color Under(Color layer, int dim, Color tint)
+        {
+            if (dim <= 0) return layer;
+            double a1 = layer.A / 255.0, d = dim / 255.0;
+            double a = a1 + d - a1 * d;                             // how much of the picture both together hide
+            if (a <= 0) return Color.FromArgb(0, 0, 0, 0);
+            double k1 = a1 * (1 - d) / a, k2 = d / a;               // each layer's share of the colour put over it
+            return Color.FromArgb((int)Math.Round(a * 255),
+                Math.Min(255, (int)Math.Round(layer.R * k1 + tint.R * k2)),
+                Math.Min(255, (int)Math.Round(layer.G * k1 + tint.G * k2)),
+                Math.Min(255, (int)Math.Round(layer.B * k1 + tint.B * k2)));
         }
 
         public override void Paint(Graphics g, Rectangle r, PageView view)
         {
             bool banner = Banner;
-            if (banner) PaintBanner(g, r, view);
-            else Theme.Art(g, view.Host.Images.Get(_imageUrl, Art, Art), new Rectangle(r.Left + Pad, r.Top + PadY, Art, Art), false);
+            if (!banner) PaintDim(g, r, view, true);                    // over the page's colour wash
+            else if (!PaintBanner(g, r, view)) PaintDim(g, r, view, view.HeaderFade >= 255);
+            if (!banner) Theme.Art(g, view.Host.Images.Get(_imageUrl, Art, Art), new Rectangle(r.Left + Pad, r.Top + PadY, Art, Art), false);
             // (the page's key colour comes from the cover picture either way, see KeyImageUrl)
             int x = r.Left + TextLeft, w = r.Width - TextLeft - Pad;
             Color soft = OnPhoto;                        // on the picture, or on the key colour
@@ -1041,6 +1575,21 @@ namespace Spotipaq
                 Rectangle b = ButtonRect(i); b.Offset(r.Left, r.Top);
                 _buttons[i].Paint(g, b, i == _hotButton);
             }
+        }
+
+        /// <summary>As the page scrolls, the whole header area (banner, or the colour behind the cover) fades into the
+        /// top bar's colour at the same rate as the bar itself, so the two meet without a seam; it is all the bar's
+        /// colour once the bar is solid. Under the cover and the texts, which stay as they are. The strip behind the
+        /// top bar is left to the bar (its own fade is the same one).</summary>
+        void PaintDim(Graphics g, Rectangle r, PageView view, bool overWash)
+        {
+            int a = view.HeaderFade;
+            if (a <= 0) return;
+            int top = Math.Max(PageView.HeaderH, r.Top - Bleed), bottom = r.Top + WashTop;
+            if (bottom <= top) return;
+            if (overWash) { view.PaintDimmedWash(g, top, bottom, a, view.HeaderTint); return; }      // the fast way
+            using (SolidBrush b = new SolidBrush(Color.FromArgb(a, view.HeaderTint)))
+                g.FillRectangle(b, 0, top, view.ClientSize.Width, bottom - top);
         }
 
         public override bool MouseMove(Point p, PageView view)
@@ -1212,32 +1761,159 @@ namespace Spotipaq
             }
             Track playing = view.Host.PlayingTrack;
             int first = Math.Max(0, (clip.Top - r.Top - HeadHeight) / _rowH);
-            int titleW = (album > 0 ? album : dur) - title - 12;
+            if (!EnsureAtlas(r.Width, view)) return;
+            // rows on screen right now, for choosing which pictures to keep
+            _shownFirst = Math.Max(0, (PageView.HeaderH - r.Top - HeadHeight) / _rowH);
+            _shownLast = (view.ClientSize.Height - r.Top - HeadHeight) / _rowH;
+            // 1. every row in the paint has an up-to-date picture in the atlas
+            List<int> rows = new List<int>();
+            List<int> slots = new List<int>();
+            List<bool> withBars = new List<bool>();
             for (int i = first; i < _tracks.Count; i++)
             {
-                Rectangle row = new Rectangle(r.Left + Pad - 10, r.Top + HeadHeight + i * _rowH, r.Width - 2 * Pad + 20, _rowH);
-                if (row.Top > clip.Bottom) break;
+                int rowTop = r.Top + HeadHeight + i * _rowH;
+                if (rowTop > clip.Bottom) break;
                 Track t = _tracks[i];
                 bool isPlaying = playing != null && playing.Id == t.Id;
+                // the playing song's bars animate, so they are drawn over the row's picture rather than into it
+                bool bars = Has(TrackColumns.Number) && isPlaying && view.Host.IsPlaying && i != _hotRow;
+                Image cover = Has(TrackColumns.Art) ? view.Host.Images.Get(t.AlbumImageUrl, _artSize, _artSize) : null;
+                rows.Add(i); slots.Add(RowPicture(i, t, isPlaying, bars, cover, r.Width, view)); withBars.Add(bars);
+            }
+            // 2. copied in with plain GDI, only the part inside the paint (GDI+ would process each whole picture)
+            if (rows.Count > 0)
+            {
+                Graphics ag = _atlas.Graphics;
+                IntPtr dst = g.GetHdc();
+                IntPtr src = ag.GetHdc();
+                try
+                {
+                    for (int k = 0; k < rows.Count; k++)
+                    {
+                        int rowTop = r.Top + HeadHeight + rows[k] * _rowH;
+                        Rectangle to = Rectangle.Intersect(new Rectangle(r.Left, rowTop, r.Width, _rowH), clip);
+                        ScrollBuffer.Copy(dst, to, src, to.X - r.Left, slots[k] * _rowH + to.Y - rowTop);
+                    }
+                }
+                finally { ag.ReleaseHdc(src); g.ReleaseHdc(dst); }
+            }
+            // 3. the playing song's bars on top
+            for (int k = 0; k < rows.Count; k++)
+                if (withBars[k]) Equalizer.Draw(g, new Rectangle(r.Left + num, r.Top + HeadHeight + rows[k] * _rowH, 30, _rowH), Theme.Accent);
+            TrimPictures();
+        }
+
+        // ---- row pictures. Drawing a row means four or five lines of text, the cover and the badges; on the Pentium II
+        // that is what made scrolling a long list slow. Each row is drawn once into its own slot of one off-screen
+        // picture (the "atlas", in the screen's pixel format, with the page's background behind it), and painting
+        // just copies it - drawn again only when what the row shows changes (the pointer, the selection, the playing
+        // song, its cover arriving, the page's colour). Only the rows on screen and a few either side have a slot:
+        // about two screens' worth, a couple of MB.
+        sealed class RowPic { public int Slot; public Track Track; public int State; public Image Cover; public int Wash; public bool Drawn; }
+        readonly Dictionary<int, RowPic> _pics = new Dictionary<int, RowPic>();
+        readonly Stack<int> _freeSlots = new Stack<int>();
+        BufferedGraphicsContext _atlasCtx;
+        BufferedGraphics _atlas;
+        int _atlasW, _atlasSlots, _shownFirst, _shownLast;
+        const int KeepAround = 4;           // rows kept either side of those on screen
+
+        public override void DropCache()
+        {
+            if (_atlas != null) { _atlas.Dispose(); _atlas = null; }
+            if (_atlasCtx != null) { _atlasCtx.Dispose(); _atlasCtx = null; }
+            _pics.Clear();
+            _freeSlots.Clear();
+            _atlasW = 0; _atlasSlots = 0;
+        }
+
+        bool EnsureAtlas(int width, PageView view)
+        {
+            int slots = view.ClientSize.Height / _rowH + 3 + 2 * KeepAround;
+            if (_atlas != null && _atlasW == width && _atlasSlots >= slots) return true;
+            DropCache();
+            if (width <= 0 || !view.IsHandleCreated) return false;
+            _atlasCtx = new BufferedGraphicsContext();
+            _atlasCtx.MaximumBuffer = new Size(width + 1, slots * _rowH + 1);        // kept, not a fresh one per use
+            using (Graphics sg = view.CreateGraphics()) _atlas = _atlasCtx.Allocate(sg, new Rectangle(0, 0, width, slots * _rowH));
+            _atlasW = width; _atlasSlots = slots;
+            for (int s = slots - 1; s >= 0; s--) _freeSlots.Push(s);
+            return true;
+        }
+
+        /// <summary>The atlas slot holding row i's picture, drawn first if it isn't up to date.</summary>
+        int RowPicture(int i, Track t, bool isPlaying, bool bars, Image cover, int width, PageView view)
+        {
+            bool hot = i == _hotRow;
+            int state = (i == _selected ? 1 : 0) | (hot ? 2 : 0) | (isPlaying ? 4 : 0) | (bars ? 8 : 0) |
+                        (hot && isPlaying && view.Host.IsPlaying ? 16 : 0) |           // play or pause glyph
+                        (hot && _hotLink == "artist" ? 32 : 0) | (hot && _hotLink == "album" ? 64 : 0);
+            RowPic p;
+            if (!_pics.TryGetValue(i, out p))
+            {
+                if (_freeSlots.Count == 0) FreeFarthest(i);
+                p = new RowPic();
+                p.Slot = _freeSlots.Pop();
+                _pics[i] = p;
+            }
+            if (p.Drawn && p.Track == t && p.State == state && p.Cover == cover && p.Wash == view.WashVersion) return p.Slot;
+            p.Track = t; p.State = state; p.Cover = cover; p.Wash = view.WashVersion; p.Drawn = true;
+            Graphics ag = _atlas.Graphics;
+            Rectangle slot = new Rectangle(0, p.Slot * _rowH, width, _rowH);
+            ag.SetClip(slot);
+            view.PaintBackdrop(ag, slot, Top + HeadHeight + i * _rowH);
+            PaintRow(ag, i, t, 0, slot.Top, width, isPlaying, bars, cover, view);
+            ag.ResetClip();
+            return p.Slot;
+        }
+
+        /// <summary>Frees the slot of the kept row farthest from row i (all slots taken).</summary>
+        void FreeFarthest(int i)
+        {
+            int worst = -1, worstD = -1;
+            foreach (int k in _pics.Keys) { int d = Math.Abs(k - i); if (d > worstD) { worstD = d; worst = k; } }
+            if (worst < 0) return;
+            _freeSlots.Push(_pics[worst].Slot);
+            _pics.Remove(worst);
+        }
+
+        /// <summary>Frees the slots of rows well away from the screen.</summary>
+        void TrimPictures()
+        {
+            int lo = _shownFirst - KeepAround, hi = _shownLast + KeepAround;
+            if (_pics.Count <= hi - lo + 1) return;
+            List<int> drop = null;
+            foreach (int k in _pics.Keys) if (k < lo || k > hi) { if (drop == null) drop = new List<int>(); drop.Add(k); }
+            if (drop == null) return;
+            foreach (int k in drop) { _freeSlots.Push(_pics[k].Slot); _pics.Remove(k); }
+        }
+
+        /// <summary>One row, with its top-left corner at (left, cy) and the block's width (the number column is left
+        /// empty when the bars go there - they are drawn on top, see Paint).</summary>
+        void PaintRow(Graphics g, int i, Track t, int left, int cy, int width, bool isPlaying, bool bars, Image cover, PageView view)
+        {
+            int num, art, title, album, extra, dur;
+            Columns(width, out num, out art, out title, out album, out extra, out dur);
+            int titleW = (album > 0 ? album : dur) - title - 12;
+            {
+                Rectangle row = new Rectangle(left + Pad - 10, cy, width - 2 * Pad + 20, _rowH);
                 bool selected = i == _selected;             // a clicked row, until something else is clicked (see ClearSelection)
                 if (selected || i == _hotRow)
                     using (SolidBrush b = new SolidBrush(selected ? Theme.RowSelected : Theme.RowHover)) g.FillRectangle(b, row);
                 Color main = isPlaying ? Theme.Accent : Theme.Text, sub = Theme.SubText;      // only the title turns green
-                int cy = row.Top;
                 if (Has(TrackColumns.Number))
                 {
-                    Rectangle nr = new Rectangle(r.Left + num, cy, 30, _rowH);
-                    // as on Spotify: the pointer's row shows play / pause; the playing song bouncing bars, or
-                    // (paused) its number in green; any other row its number
+                    Rectangle nr = new Rectangle(left + num, cy, 30, _rowH);
+                    // as on Spotify: the pointer's row shows play / pause; the playing song bouncing bars (drawn by
+                    // Paint, over this), or (paused) its number in green; any other row its number
                     if (i == _hotRow) DrawPlayGlyph(g, nr, isPlaying && view.Host.IsPlaying, isPlaying);
-                    else if (isPlaying && view.Host.IsPlaying) Equalizer.Draw(g, nr, Theme.Accent);
+                    else if (bars) { }
                     else Theme.Draw(g, (t.Number > 0 && !Has(TrackColumns.Art) ? t.Number : i + 1).ToString(), Theme.Normal, nr,
                         isPlaying ? Theme.Accent : Theme.SubText, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
                 }
                 if (Has(TrackColumns.Art))
-                    Theme.Art(g, view.Host.Images.Get(t.AlbumImageUrl, _artSize, _artSize), new Rectangle(r.Left + art, cy + (_rowH - _artSize) / 2, _artSize, _artSize), false);
+                    Theme.Art(g, cover, new Rectangle(left + art, cy + (_rowH - _artSize) / 2, _artSize, _artSize), false);
                 // title (and, on two-line rows, the artist under it)
-                Rectangle line1 = TwoLine ? new Rectangle(r.Left + title, cy + 6, titleW, 18) : new Rectangle(r.Left + title, cy, titleW, _rowH);
+                Rectangle line1 = TwoLine ? new Rectangle(left + title, cy + 6, titleW, 18) : new Rectangle(left + title, cy, titleW, _rowH);
                 Theme.Text1(g, t.Name, Theme.Normal, new Rectangle(line1.Left, line1.Top, line1.Width - (t.Explicit ? 66 : 0), line1.Height), main);
                 if (t.Explicit)
                 {
@@ -1245,12 +1921,12 @@ namespace Spotipaq
                     using (Pen p = new Pen(Theme.DimText)) g.DrawRectangle(p, ex);
                     Theme.Draw(g, "EXPLICIT", Theme.Label, ex, Theme.DimText, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
                 }
-                if (TwoLine) Link(g, t.ArtistName, Theme.Small, new Rectangle(r.Left + title, cy + 24, titleW, 16), sub, i == _hotRow && _hotLink == "artist");
-                if (album > 0) Link(g, t.AlbumName, Theme.Normal, new Rectangle(r.Left + album, cy, dur - album - 12, _rowH), sub, i == _hotRow && _hotLink == "album");
-                Theme.Text1(g, Theme.Time(t.DurationMs), Theme.Normal, new Rectangle(r.Left + dur, cy, 50, _rowH), sub);
-                if (Has(TrackColumns.Popularity)) PopularityBars(g, r.Left + extra, cy + _rowH / 2 - 5, t.Popularity);
+                if (TwoLine) Link(g, t.ArtistName, Theme.Small, new Rectangle(left + title, cy + 24, titleW, 16), sub, i == _hotRow && _hotLink == "artist");
+                if (album > 0) Link(g, t.AlbumName, Theme.Normal, new Rectangle(left + album, cy, dur - album - 12, _rowH), sub, i == _hotRow && _hotLink == "album");
+                Theme.Text1(g, Theme.Time(t.DurationMs), Theme.Normal, new Rectangle(left + dur, cy, 50, _rowH), sub);
+                if (Has(TrackColumns.Popularity)) PopularityBars(g, left + extra, cy + _rowH / 2 - 5, t.Popularity);
                 if (Has(TrackColumns.PlayCount))
-                    Theme.Draw(g, t.PlayCount.ToString("n0"), Theme.Normal, new Rectangle(r.Left + extra, cy, 110, _rowH), Theme.SubText,
+                    Theme.Draw(g, t.PlayCount.ToString("n0"), Theme.Normal, new Rectangle(left + extra, cy, 110, _rowH), Theme.SubText,
                         TextFormatFlags.Right | TextFormatFlags.VerticalCenter);
             }
         }

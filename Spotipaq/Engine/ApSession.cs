@@ -93,6 +93,7 @@ namespace Spotipaq.Engine
                 HttpResult r = Native.Get("https://apresolve.spotify.com/?type=accesspoint", null);
                 if (r.Ok)
                     foreach (JToken t in (JArray)JObject.Parse(r.Text)["accesspoint"]) aps.Add((string)t);
+                if (aps.Count > 0) Remembered.Set("accesspoints", String.Join(",", aps.ToArray()));
             }
             catch (Exception ex) { Log.Write("apresolve failed: " + ex.Message); }
             if (aps.Count == 0) aps.Add("ap.spotify.com:4070");
@@ -103,7 +104,21 @@ namespace Spotipaq.Engine
         /// <summary>Connects to an access point and logs in. Blocking; throws on failure.</summary>
         public void ConnectAndLogin(LoginCredentials creds)
         {
-            List<string> aps = ResolveAccessPoints();
+            // the servers from last time first, without asking which to use (that costs a whole extra HTTPS request
+            // before connecting); if none of them works, ask and try again
+            string known = Remembered.Get("accesspoints", TimeSpan.FromDays(3));
+            if (known != null)
+            {
+                try { TryAccessPoints(new List<string>(known.Split(',')), creds); return; }
+                catch (ApLoginException ex) { if (ex.ErrorCode != 0x2) throw; }
+                catch (Exception ex) { Log.Write("Remembered access points failed (" + ex.Message + "); asking again"); }
+                Remembered.Forget("accesspoints");
+            }
+            TryAccessPoints(ResolveAccessPoints(), creds);
+        }
+
+        void TryAccessPoints(List<string> aps, LoginCredentials creds)
+        {
             Exception last = null;
             for (int i = 0; i < aps.Count && i < 4; i++)
             {

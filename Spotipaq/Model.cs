@@ -42,6 +42,7 @@ namespace Spotipaq
         public string HeaderImageUrl;      // wide banner picture (radios, mixes, "This Is", editorial playlists), or null
         public string MadeFor;             // user name, for playlists Spotify generated for someone
         public string Color;               // "#RRGGBB": the colour Spotify itself picked for the cover (page background), or null
+        public string Revision;            // which version of the playlist this is (Spotify's revision, hex), or null
         public List<Track> Tracks = new List<Track>();
     }
 

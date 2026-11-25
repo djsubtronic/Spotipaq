@@ -121,6 +121,9 @@ namespace Spotipaq
         public string GetSongRadio(string trackId) { return null; }
         public void SetSaved(string uri, bool saved) { }
 
+        public Playlist GetCachedPlaylist(string id) { return null; }
+        public List<Playlist> GetCachedPlaylists() { return null; }
+
         public Playlist GetPlaylist(string id)
         {
             Latency();

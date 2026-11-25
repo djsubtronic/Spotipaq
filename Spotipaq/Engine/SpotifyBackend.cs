@@ -136,16 +136,39 @@ namespace Spotipaq.Engine
             return t;
         }
 
-        List<Track> FetchTracks(IList<string> ids)
+        List<Track> FetchTracks(IList<string> ids) { return FetchTracks(ids, false); }
+
+        /// <summary>The songs' details, from the song cache where it has them, from Spotify for the rest (which are
+        /// then cached). cachedOnly: never ask Spotify - null if any song isn't cached.</summary>
+        List<Track> FetchTracks(IList<string> ids, bool cachedOnly)
         {
             List<string> uris = new List<string>();
             foreach (string id in ids) uris.Add(Uri("track", id));
-            Dictionary<string, byte[]> meta = _sp.ExtMeta(10, uris);
+            TrackCache cache = SongCache();
+            Dictionary<string, byte[]> meta = new Dictionary<string, byte[]>();
+            List<string> missing = new List<string>();
+            Dictionary<string, bool> asked = new Dictionary<string, bool>();
+            foreach (string u in uris)
+            {
+                if (meta.ContainsKey(u) || asked.ContainsKey(u)) continue;
+                byte[] known = cache.Get(u);
+                if (known != null) meta[u] = known;
+                else { missing.Add(u); asked[u] = true; }
+            }
+            if (missing.Count > 0)
+            {
+                if (cachedOnly) return null;
+                Dictionary<string, byte[]> fresh = _sp.ExtMeta(10, missing);
+                foreach (string u in missing) if (!fresh.ContainsKey(u)) fresh[u] = new byte[0];      // no details: unavailable (remembered too)
+                cache.Add(fresh);
+                foreach (KeyValuePair<string, byte[]> kv in fresh) meta[kv.Key] = kv.Value;
+            }
+            if (uris.Count > 0) LoadTimer.Note((uris.Count - missing.Count) + " of " + uris.Count + " songs' details cached");
             List<Track> list = new List<Track>();
             foreach (string u in uris)
             {
                 byte[] b;
-                if (meta.TryGetValue(u, out b))
+                if (meta.TryGetValue(u, out b) && b.Length > 0)
                 {
                     try { list.Add(ParseTrack(b)); } catch (Exception ex) { Log.Write("Bad track metadata: " + ex.Message); }
                 }
@@ -317,6 +340,13 @@ namespace Spotipaq.Engine
 
         public List<Playlist> GetPlaylists()
         {
+            List<Playlist> list = FetchPlaylists();
+            SavePlaylistList(list);
+            return list;
+        }
+
+        List<Playlist> FetchPlaylists()
+        {
             try
             {
                 List<Playlist> fromLibrary = new List<Playlist>();
@@ -337,7 +367,9 @@ namespace Spotipaq.Engine
 
         List<Playlist> GetPlaylistsFromRootlist()
         {
-            string user = _engine.EnsureConnected().Username;
+            // the username from the saved login: no waiting for the main session
+            LoginCredentials saved = CredentialStore.Load();
+            string user = saved != null && !String.IsNullOrEmpty(saved.Username) ? saved.Username : _engine.EnsureConnected().Username;
             HttpResult r = _sp.Sp("GET", "/playlist/v2/user/" + user + "/rootlist?decorate=revision%2Cattributes%2Clength%2Cowner%2Ccapabilities&from=0&length=200", null, null);
             if (!r.Ok) throw new InvalidOperationException("Couldn't load your playlists (HTTP " + r.Status + ")");
             Dictionary<int, List<ProtoField>> top = new ProtoReader(r.Body).ReadAll();
@@ -402,13 +434,132 @@ namespace Spotipaq.Engine
             return uri.Substring(uri.LastIndexOf(':') + 1);
         }
 
+        // ---------- caches: song details and saved playlists ----------
+        // A playlist opened before shows straight away as it was saved, and MainForm then checks the current version
+        // in the background (GetPlaylist), swapping it in only if it changed. Playlists made for the user (Daily Mixes,
+        // Discover Weekly...) change too often to be worth it: they are never saved. Song details are kept for every
+        // playlist, album and artist page, so only songs never seen before are asked about.
+        static string CacheFolder { get { return Path.Combine(Log.Folder, "cache"); } }
+        static string PlaylistFile(string id) { return Path.Combine(Path.Combine(CacheFolder, "playlists"), id + ".dat"); }
+        readonly object _cacheLock = new object();
+        TrackCache _songs;
+
+        TrackCache SongCache()
+        {
+            lock (_cacheLock)
+            {
+                if (_songs == null) _songs = new TrackCache(Path.Combine(CacheFolder, "songs.dat"), _sp.Country);
+                return _songs;
+            }
+        }
+
+        // The sidebar list, one playlist per line: "P1", then id, name, owner, cover, colour, description, tab
+        // separated (tabs and line breaks inside them become spaces). Shown at start-up while GetPlaylists checks.
+        static string PlaylistListFile { get { return Path.Combine(CacheFolder, "sidebar.txt"); } }
+
+        public List<Playlist> GetCachedPlaylists()
+        {
+            string path = PlaylistListFile;
+            try
+            {
+                if (!File.Exists(path)) return null;
+                List<Playlist> list = new List<Playlist>();
+                foreach (string line in File.ReadAllLines(path, Encoding.UTF8))
+                {
+                    string[] f = line.Split('\t');
+                    if (f.Length < 7 || f[0] != "P1" || f[1].Length == 0) continue;
+                    Playlist p = new Playlist();
+                    p.Id = f[1]; p.Name = f[2].Length > 0 ? f[2] : "Playlist"; p.Owner = f[3];
+                    p.ImageUrl = Empty(f[4]); p.Color = Empty(f[5]); p.Description = Empty(f[6]);
+                    if (p.Color != null) lock (_coverColors) if (!_coverColors.ContainsKey(p.Id)) _coverColors[p.Id] = p.Color;
+                    list.Add(p);
+                }
+                return list;
+            }
+            catch (Exception ex)
+            {
+                Log.Write("Saved playlist list unreadable: " + ex.Message);
+                try { File.Delete(path); } catch { }
+                return null;
+            }
+        }
+
+        static string Empty(string s) { return String.IsNullOrEmpty(s) ? null : s; }
+
+        static string Field(string s)
+        {
+            if (String.IsNullOrEmpty(s)) return "";
+            return s.Replace('\t', ' ').Replace('\r', ' ').Replace('\n', ' ');
+        }
+
+        void SavePlaylistList(List<Playlist> list)
+        {
+            if (list == null) return;
+            try
+            {
+                StringBuilder sb = new StringBuilder();
+                foreach (Playlist p in list)
+                {
+                    if (String.IsNullOrEmpty(p.Id)) continue;
+                    sb.Append("P1\t").Append(Field(p.Id)).Append('\t').Append(Field(p.Name)).Append('\t').Append(Field(p.Owner)).Append('\t')
+                      .Append(Field(p.ImageUrl)).Append('\t').Append(Field(p.Color)).Append('\t').Append(Field(p.Description)).Append("\r\n");
+                }
+                string path = PlaylistListFile, temp = path + ".tmp";
+                Directory.CreateDirectory(CacheFolder);
+                File.WriteAllText(temp, sb.ToString(), new UTF8Encoding(false));
+                if (File.Exists(path)) File.Delete(path);
+                File.Move(temp, path);
+            }
+            catch (Exception ex) { Log.Write("Couldn't save the playlist list: " + ex.Message); }
+        }
+
+        public Playlist GetCachedPlaylist(string id)
+        {
+            string path = PlaylistFile(id);
+            if (id.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0 || !File.Exists(path)) return null;
+            try { return BuildPlaylist(id, File.ReadAllBytes(path), true); }      // null when a song isn't cached
+            catch (Exception ex)
+            {
+                Log.Write("Saved playlist unreadable, loading it afresh: " + ex.Message);
+                try { File.Delete(path); } catch { }
+                return null;
+            }
+        }
+
         public Playlist GetPlaylist(string id)
         {
             HttpResult r = _sp.Sp("GET", "/playlist/v2/playlist/" + id, null, null);
             if (!r.Ok) throw new InvalidOperationException("Couldn't load the playlist (HTTP " + r.Status + ")");
-            Dictionary<int, List<ProtoField>> top = new ProtoReader(r.Body).ReadAll();
+            Playlist p = BuildPlaylist(id, r.Body, false);
+            if (id.IndexOfAny(Path.GetInvalidFileNameChars()) < 0)
+            {
+                string path = PlaylistFile(id);
+                try
+                {
+                    if (p.MadeFor == null)
+                    {
+                        Directory.CreateDirectory(Path.GetDirectoryName(path));
+                        string temp = path + ".tmp";
+                        File.WriteAllBytes(temp, r.Body);
+                        if (File.Exists(path)) File.Delete(path);
+                        File.Move(temp, path);
+                    }
+                    else if (File.Exists(path)) File.Delete(path);      // made for the user: always loaded fresh
+                }
+                catch (Exception ex) { Log.Write("Couldn't save the playlist: " + ex.Message); }
+            }
+            return p;
+        }
+
+        /// <summary>A playlist from Spotify's reply (fresh or saved). cachedOnly: songs only from the song cache -
+        /// null if one isn't there.</summary>
+        Playlist BuildPlaylist(string id, byte[] body, bool cachedOnly)
+        {
+            Dictionary<int, List<ProtoField>> top = new ProtoReader(body).ReadAll();
             Playlist p = new Playlist();
             p.Id = id;
+            ProtoField? rev = ProtoReader.First(top, 1);
+            if (rev != null && rev.Value.Data != null) p.Revision = Spclient.Hex(rev.Value.Data);
             p.Owner = Str(top, 16);
             ProtoField? at = ProtoReader.First(top, 3);
             Dictionary<int, List<ProtoField>> attrs = null;
@@ -430,7 +581,9 @@ namespace Spotipaq.Engine
                         if (uri != null && uri.StartsWith("spotify:track:", StringComparison.Ordinal) && ids.Count < 500) ids.Add(LastPart(uri));
                     }
             }
-            p.Tracks = FetchTracks(ids);
+            p.Tracks = FetchTracks(ids, cachedOnly);
+            if (p.Tracks == null) return null;
+            LoadTimer.Note("\"" + p.Name + "\", " + ids.Count + " songs");
             string cover = attrs != null ? PlaylistCover(attrs) : null;
             lock (_coverColors) { string col; if (_coverColors.TryGetValue(id, out col)) p.Color = col; }
             if (attrs != null)
@@ -442,12 +595,11 @@ namespace Spotipaq.Engine
                 if (fa.TryGetValue("header_image_url_desktop", out v) && v.StartsWith("https://", StringComparison.Ordinal)) p.HeaderImageUrl = v;
                 if (fa.TryGetValue("madeFor.username", out v) && v.Length > 0 && (!fa.ContainsKey("madeFor.displayed") || fa["madeFor.displayed"] == "1")) p.MadeFor = v;
             }
-            if (cover != null && ImageExists(cover)) { p.ImageUrl = cover; Log.Write("Playlist cover: its own picture"); }
-            else
-            {
-                Log.Write("Playlist cover: " + (cover == null ? "none set, using first song's art" : "picture unavailable, using first song's art"));
-                if (p.Tracks.Count > 0) p.ImageUrl = p.Tracks[0].AlbumImageUrl;
-            }
+            // The cover, with the first song's art to fall back on (the two on separate lines: ImageCache tries them in
+            // order). Checking first whether the cover exists made every playlist page wait for one more request.
+            string firstArt = p.Tracks.Count > 0 ? p.Tracks[0].AlbumImageUrl : null;
+            if (cover == null) Log.Write("Playlist cover: none set, using first song's art");
+            p.ImageUrl = cover == null ? firstArt : String.IsNullOrEmpty(firstArt) ? cover : cover + "\n" + firstArt;
             return p;
         }
 
@@ -513,12 +665,6 @@ namespace Spotipaq.Engine
                 catch { }
             }
             return d;
-        }
-
-        static bool ImageExists(string url)
-        {
-            try { HttpResult r = Native.Http("GET", url, "Range: bytes=0-0\r\n", null); return r.Status == 200 || r.Status == 206; }
-            catch { return false; }
         }
 
         // ---------- albums + artists ----------
@@ -806,6 +952,123 @@ namespace Spotipaq.Engine
             if (s == null) return null;
             if (s.IndexOf('<') >= 0) s = System.Text.RegularExpressions.Regex.Replace(s, "<[^>]*>", "");
             return Decode(s).Trim();
+        }
+    }
+
+    /// <summary>
+    /// Song details (Spotify's extended metadata, exactly as it sent them) kept on disk between runs, so a playlist,
+    /// album or artist page only asks Spotify about songs it hasn't seen before. One file, read in full once per run
+    /// and added to as new songs arrive. Details older than 30 days are dropped and fetched again, so changes (a song
+    /// becoming unavailable...) are picked up. An empty entry = Spotify had no details for it (unavailable). The file
+    /// belongs to one country, since that decides what is available; a different country starts it afresh.
+    /// </summary>
+    sealed class TrackCache
+    {
+        const int MaxAgeDays = 30, MaxEntries = 20000;
+        const string Format = "SPQT1";
+        sealed class Entry { public long Ticks; public byte[] Data; }
+
+        readonly object _lock = new object();
+        readonly string _path, _country;
+        Dictionary<string, Entry> _map;            // loaded on first use
+
+        public TrackCache(string path, string country) { _path = path; _country = country ?? ""; }
+
+        public byte[] Get(string uri)
+        {
+            lock (_lock)
+            {
+                if (_map == null) Load();
+                Entry e;
+                return _map.TryGetValue(uri, out e) ? e.Data : null;
+            }
+        }
+
+        public void Add(Dictionary<string, byte[]> fresh)
+        {
+            if (fresh.Count == 0) return;
+            lock (_lock)
+            {
+                if (_map == null) Load();
+                long now = DateTime.UtcNow.Ticks;
+                foreach (KeyValuePair<string, byte[]> kv in fresh) _map[kv.Key] = new Entry { Ticks = now, Data = kv.Value };
+                try
+                {
+                    using (FileStream fs = new FileStream(_path, FileMode.Append, FileAccess.Write))
+                    using (BinaryWriter w = new BinaryWriter(fs))
+                        foreach (KeyValuePair<string, byte[]> kv in fresh) { w.Write(now); w.Write(kv.Key); w.Write(kv.Value.Length); w.Write(kv.Value); }
+                }
+                catch (Exception ex) { Log.Write("Song cache write failed: " + ex.Message); }
+            }
+        }
+
+        void Load()
+        {
+            _map = new Dictionary<string, Entry>();
+            int records = 0;
+            bool rewrite = !File.Exists(_path);
+            if (!rewrite)
+            {
+                try
+                {
+                    using (BinaryReader r = new BinaryReader(File.OpenRead(_path)))
+                    {
+                        if (r.ReadString() != Format || r.ReadString() != _country) rewrite = true;
+                        else
+                        {
+                            long cutoff = DateTime.UtcNow.AddDays(-MaxAgeDays).Ticks;
+                            try
+                            {
+                                while (r.BaseStream.Position < r.BaseStream.Length)
+                                {
+                                    long ticks = r.ReadInt64();
+                                    string uri = r.ReadString();
+                                    int n = r.ReadInt32();
+                                    if (n < 0 || n > 1 << 20) { rewrite = true; break; }
+                                    byte[] d = r.ReadBytes(n);
+                                    if (d.Length != n) { rewrite = true; break; }      // cut short by an interrupted write
+                                    records++;
+                                    if (ticks >= cutoff) _map[uri] = new Entry { Ticks = ticks, Data = d };
+                                }
+                            }
+                            catch (EndOfStreamException) { rewrite = true; }
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Log.Write("Song cache unreadable, starting it again: " + ex.Message);
+                    _map.Clear();
+                    rewrite = true;
+                }
+            }
+            // also tidied when much of it is out of date or repeated, or when it has grown too big
+            if (rewrite || records > _map.Count + _map.Count / 2 + 200 || _map.Count > MaxEntries) Rewrite();
+            Log.Write("Song cache: " + _map.Count + " songs");
+        }
+
+        void Rewrite()
+        {
+            if (_map.Count > MaxEntries)
+            {
+                List<KeyValuePair<string, Entry>> all = new List<KeyValuePair<string, Entry>>(_map);
+                all.Sort(delegate (KeyValuePair<string, Entry> x, KeyValuePair<string, Entry> y) { return y.Value.Ticks.CompareTo(x.Value.Ticks); });
+                _map = new Dictionary<string, Entry>();
+                for (int i = 0; i < MaxEntries; i++) _map[all[i].Key] = all[i].Value;
+            }
+            try
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(_path));
+                string temp = _path + ".tmp";
+                using (BinaryWriter w = new BinaryWriter(File.Create(temp)))
+                {
+                    w.Write(Format); w.Write(_country);
+                    foreach (KeyValuePair<string, Entry> kv in _map) { w.Write(kv.Value.Ticks); w.Write(kv.Key); w.Write(kv.Value.Data.Length); w.Write(kv.Value.Data); }
+                }
+                if (File.Exists(_path)) File.Delete(_path);
+                File.Move(temp, _path);
+            }
+            catch (Exception ex) { Log.Write("Song cache rewrite failed: " + ex.Message); }
         }
     }
 }

@@ -179,11 +179,15 @@ namespace Spotipaq
         public Sidebar()
         {
             _bar = new SlimScroll(this, delegate { return _scroll; }, delegate { return MaxScroll; },
-                delegate (int v) { _scroll = v; ClampScroll(); }, RowH * 2, BarTrack, BarThumb, BarThumbDrag);
+                delegate (int v) { ScrollTo(v); }, RowH * 2, BarTrack, BarThumb, BarThumbDrag);
+            _bar.OwnerRepaints = true;                      // ScrollTo moves the pixels and repaints the bar itself
             _bar.TopInset = TopH;                           // the bar belongs to the playlists, not the header
             _bar.ViewInset = TopH;
             _bar.BottomInset = Theme.CardRadius;
-            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+            // no OptimizedDoubleBuffer: the list keeps its own off-screen copy (_copy), which also serves as the buffer
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.ResizeRedraw, true);
+            SetStyle(ControlStyles.OptimizedDoubleBuffer, false);
+            _copy = new ScrollBuffer(this);
             BackColor = Theme.Sidebar;
             _autoScroll.Interval = 40;
             _autoScroll.Tick += delegate
@@ -221,6 +225,50 @@ namespace Spotipaq
         static readonly Color RowHot = Color.FromArgb(31, 31, 31);          // under the pointer
 
         protected override void OnResize(EventArgs e) { base.OnResize(e); ClampScroll(); }
+
+        // ---- scrolling by moving the rows already on screen (PixelScroll) and painting only the strip that comes into
+        // view, the scrollbar's strip and the rounded bottom corners - not every row again on each step. The fixed top
+        // (title and pills) is outside the moved area, so it is left alone.
+        int _scrolledAt;                       // Environment.TickCount of the last step (0 = none yet)
+
+        /// <summary>True while the list is being scrolled (and briefly after): repaints that can wait, should.</summary>
+        public bool Scrolling { get { return _scrolledAt != 0 && unchecked(Environment.TickCount - _scrolledAt) < 250; } }
+
+        void ScrollTo(int target)
+        {
+            if (IsHandleCreated) Update();     // anything already waiting is painted at the old position first
+            int old = _scroll;
+            _scroll = target;
+            ClampScroll();
+            int dy = _scroll - old;
+            if (dy == 0) return;
+            _scrolledAt = Environment.TickCount;
+            if (_scrolledAt == 0) _scrolledAt = 1;
+            int w = ClientSize.Width, h = ClientSize.Height;
+            int bottom = Math.Max(TopH, h - Theme.CardRadius);
+            Rectangle area = new Rectangle(0, TopH, Math.Max(0, Math.Min(w, ViewW)), bottom - TopH);
+            // all in the off-screen copy; the screen only gets the finished step
+            if (_dragging || !_copy.Shift(area, dy)) { Invalidate(); Update(); return; }
+            List<Rectangle> parts = new List<Rectangle>();
+            parts.Add(dy > 0 ? new Rectangle(0, area.Bottom - dy, w, dy)          // the strip that came into view
+                             : new Rectangle(0, area.Top, w, -dy));
+            parts.Add(new Rectangle(area.Right, TopH, w - area.Right, bottom - TopH));     // the scrollbar's strip
+            parts.Add(new Rectangle(0, bottom, w, h - bottom));                 // bottom corners
+            List<Rectangle> pieces = ScrollBuffer.Coalesce(parts, ClientSize);
+            ClipPainter paint = PaintList;
+            foreach (Rectangle p in pieces) _copy.Draw(p, paint);
+            _copy.PresentScrolled(area, dy, pieces);       // the screen moves its own pixels, then takes just these
+        }
+
+        readonly ScrollBuffer _copy;           // the list's own off-screen copy of what it shows (see ScrollBuffer)
+
+        protected override void OnPaintBackground(PaintEventArgs e) { }        // OnPaint covers everything
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing) { _copy.Dispose(); _autoScroll.Dispose(); }
+            base.Dispose(disposing);
+        }
 
         int RowTop(int i) { return TopH + i * RowH - _scroll; }
         int RowAt(int y)
@@ -263,9 +311,13 @@ namespace Spotipaq
 
         protected override void OnPaint(PaintEventArgs e)
         {
-            Graphics g = e.Graphics;
+            if (!_copy.Paint(e.Graphics, e.ClipRectangle, PaintList)) PaintList(e.Graphics, e.ClipRectangle);
+        }
+
+        /// <summary>Paints the part of the card inside clip (client coordinates) with g.</summary>
+        void PaintList(Graphics g, Rectangle clip)       // hovering repaints a row or a pill, not the whole card
+        {
             g.Clear(Theme.Sidebar);
-            Rectangle clip = e.ClipRectangle;            // hovering repaints a row or a pill, not the whole card
 
             // playlists
             for (int i = 0; i < _lists.Count; i++)
@@ -412,9 +464,7 @@ namespace Spotipaq
 
         protected override void OnMouseWheel(MouseEventArgs e)
         {
-            _scroll -= e.Delta / 120 * RowH * 2;
-            ClampScroll();
-            Invalidate();
+            ScrollTo(_scroll - e.Delta / 120 * RowH * 2);
             base.OnMouseWheel(e);
         }
     }

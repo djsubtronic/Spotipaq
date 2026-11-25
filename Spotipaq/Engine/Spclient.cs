@@ -2,12 +2,130 @@
 // web services (spclient, pathfinder). Port of librespot-java's Login5Api / ApiClient.
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Security.Cryptography;
 using System.Text;
 using Newtonsoft.Json.Linq;
 
 namespace Spotipaq.Engine
 {
+    /// <summary>
+    /// Where one page load's time went, for the log: one line per page (MainForm.LoadPage), e.g.
+    ///   Loaded playlist in 2410 ms: token 2140, playlist 180, details 5 x 300 = 1500, details parse 40, other 50
+    ///   ("Daily Mix 6", 50 songs; token renewed in 2130 ms, session reconnected)
+    /// The parts never overlap, so they add up to the total; "other" is everything not measured separately.
+    /// Collected on the thread doing the load; calls on other threads (artwork, playback) aren't counted.
+    /// </summary>
+    public sealed class LoadTimer
+    {
+        [ThreadStatic] static LoadTimer _current;
+        readonly string _what;
+        readonly long _start = Now;
+        readonly List<string> _order = new List<string>();
+        readonly Dictionary<string, double> _ms = new Dictionary<string, double>();
+        readonly Dictionary<string, int> _count = new Dictionary<string, int>();
+        readonly List<string> _notes = new List<string>();
+
+        LoadTimer(string what) { _what = what; }
+
+        /// <summary>Starts timing a page load on this thread.</summary>
+        public static LoadTimer Start(string what) { _current = new LoadTimer(what); return _current; }
+
+        public static long Now { get { return System.Diagnostics.Stopwatch.GetTimestamp(); } }
+        public static double Ms(long since) { return (Now - since) * 1000.0 / System.Diagnostics.Stopwatch.Frequency; }
+
+        /// <summary>Adds the time since `since` (a Now value) to a part of the load being timed on this thread, if any.</summary>
+        public static void Add(string part, long since)
+        {
+            LoadTimer t = _current;
+            if (t == null) return;
+            double ms = Ms(since), had;
+            if (t._ms.TryGetValue(part, out had)) { t._ms[part] = had + ms; t._count[part]++; }
+            else { t._ms[part] = ms; t._count[part] = 1; t._order.Add(part); }
+        }
+
+        /// <summary>Adds a remark to the line (what was loaded, a token renewal...).</summary>
+        public static void Note(string text) { LoadTimer t = _current; if (t != null) t._notes.Add(text); }
+
+        /// <summary>Writes the line and stops timing.</summary>
+        public void Finish(bool ok)
+        {
+            if (_current == this) _current = null;
+            double total = Ms(_start), accounted = 0;
+            StringBuilder sb = new StringBuilder();
+            sb.Append(ok ? "Loaded " : "Failed loading ").Append(_what).Append(" in ").Append((int)total).Append(" ms");
+            string sep = ": ";
+            foreach (string p in _order)
+            {
+                int n = _count[p];
+                sb.Append(sep).Append(p).Append(' ');
+                if (n > 1) sb.Append(n).Append(" x ").Append((int)(_ms[p] / n)).Append(" = ");
+                sb.Append((int)_ms[p]);
+                accounted += _ms[p];
+                sep = ", ";
+            }
+            if (_order.Count > 0) sb.Append(", other ").Append((int)Math.Max(0, total - accounted));
+            if (_notes.Count > 0) sb.Append(" (").Append(String.Join("; ", _notes.ToArray())).Append(')');
+            Log.Write(sb.ToString());
+        }
+    }
+
+    /// <summary>Small facts kept between runs so they needn't be fetched before the first page can load: the
+    /// country, and which Spotify servers to use. One small file each in the settings folder.</summary>
+    static class Remembered
+    {
+        static readonly object Lock = new object();
+        static readonly Dictionary<string, string> Cache = new Dictionary<string, string>();
+        static readonly Dictionary<string, bool> WrittenThisRun = new Dictionary<string, bool>();
+
+        static string PathOf(string key) { return Path.Combine(Log.Folder, "remember-" + key + ".txt"); }
+
+        /// <summary>The value, if one was saved no longer than maxAge ago (TimeSpan.MaxValue = any age); else null.</summary>
+        public static string Get(string key, TimeSpan maxAge)
+        {
+            lock (Lock)
+            {
+                try
+                {
+                    string p = PathOf(key);
+                    if (!File.Exists(p)) return null;
+                    if (maxAge != TimeSpan.MaxValue && DateTime.UtcNow - File.GetLastWriteTimeUtc(p) > maxAge) return null;
+                    string v;
+                    if (!Cache.TryGetValue(key, out v)) { v = File.ReadAllText(p).Trim(); Cache[key] = v; }
+                    return v.Length > 0 ? v : null;
+                }
+                catch (Exception) { return null; }
+            }
+        }
+
+        /// <summary>Saves a value (once per run when it hasn't changed, which also renews its age).</summary>
+        public static void Set(string key, string value)
+        {
+            lock (Lock)
+            {
+                string had;
+                if (WrittenThisRun.ContainsKey(key) && Cache.TryGetValue(key, out had) && had == value) return;
+                Cache[key] = value;
+                WrittenThisRun[key] = true;
+                try
+                {
+                    if (!Directory.Exists(Log.Folder)) Directory.CreateDirectory(Log.Folder);
+                    File.WriteAllText(PathOf(key), value);
+                }
+                catch (Exception) { }
+            }
+        }
+
+        public static void Forget(string key)
+        {
+            lock (Lock)
+            {
+                Cache.Remove(key);
+                try { File.Delete(PathOf(key)); } catch (Exception) { }
+            }
+        }
+    }
+
     public sealed class Spclient
     {
         const string ClientId = OAuthLogin.ClientId;
@@ -15,8 +133,11 @@ namespace Spotipaq.Engine
 
         readonly SpotifyEngine _engine;
         readonly object _lock = new object();
+        readonly object _renewLock = new object();      // one renewal at a time; the old token stays usable meanwhile
         string _token, _clientToken, _base;
+        bool _baseRemembered;                           // _base came from the last run (see SpBase)
         DateTime _tokenExpires = DateTime.MinValue;
+        System.Threading.Timer _renewTimer;
 
         public Spclient(SpotifyEngine engine) { _engine = engine; }
 
@@ -27,24 +148,55 @@ namespace Spotipaq.Engine
             return sb.ToString();
         }
 
+        /// <summary>The account's country (it decides which songs are available): from the main session, or until that
+        /// has connected, as it was last time - pages no longer wait for the session.</summary>
         public string Country
         {
-            get { ApSession s = _engine.Session; return s != null && !String.IsNullOrEmpty(s.CountryCode) ? s.CountryCode : "US"; }
+            get
+            {
+                ApSession s = _engine.Session;
+                if (s != null && !String.IsNullOrEmpty(s.CountryCode)) { Remembered.Set("country", s.CountryCode); return s.CountryCode; }
+                return Remembered.Get("country", TimeSpan.MaxValue) ?? "US";
+            }
         }
 
         // ---- tokens ----
 
         public string Token()
         {
-            lock (_lock)
+            lock (_lock) { if (_token != null && DateTime.UtcNow < _tokenExpires) return _token; }
+            lock (_renewLock)
             {
-                if (_token != null && DateTime.UtcNow < _tokenExpires) return _token;
-                _token = null;
-                ApSession ap = _engine.EnsureConnected();
-                LoginCredentials c = ap.ReusableCredentials;
-                if (c == null) c = CredentialStore.Load();
-                if (c == null) throw new InvalidOperationException("No stored credentials");
-                string user = String.IsNullOrEmpty(c.Username) ? ap.Username : c.Username;
+                lock (_lock) { if (_token != null && DateTime.UtcNow < _tokenExpires) return _token; }   // renewed meanwhile
+                return Renew();
+            }
+        }
+
+        /// <summary>Gets a new access token (callers hold _renewLock). The saved login is all Login5 needs, so this
+        /// doesn't wait for the main session (playback's connection, slow to set up): that connects in the background.
+        /// Only a login that isn't a reusable one yet (just after the first login) needs the session first.</summary>
+        string Renew()
+        {
+            {
+                long renew = LoadTimer.Now;
+                LoginCredentials c = CredentialStore.Load();
+                string user;
+                if (c != null && c.Type == AuthType.StoredSpotifyCredentials && !String.IsNullOrEmpty(c.Username))
+                {
+                    user = c.Username;
+                    ConnectInBackground();
+                }
+                else
+                {
+                    ApSession before = _engine.Session;
+                    bool wasUp = before != null && before.Connected;
+                    ApSession ap = _engine.EnsureConnected();
+                    if (!wasUp) LoadTimer.Note("session connected in " + (int)LoadTimer.Ms(renew) + " ms");
+                    c = ap.ReusableCredentials;
+                    if (c == null) c = CredentialStore.Load();
+                    if (c == null) throw new InvalidOperationException("No stored credentials");
+                    user = String.IsNullOrEmpty(c.Username) ? ap.Username : c.Username;
+                }
 
                 ProtoWriter stored = new ProtoWriter().String(1, user).Bytes(2, c.AuthData);
                 byte[] resp = Login5(null, null, stored);
@@ -72,13 +224,41 @@ namespace Spotipaq.Engine
                     throw new InvalidOperationException("Login5 refused the stored login (error " + (err == null ? -1 : (int)err.Value.Int) + ")");
                 }
                 Dictionary<int, List<ProtoField>> okf = ok.Value.Message.ReadAll();
-                _token = ProtoReader.First(okf, 2).Value.Text;
+                string token = ProtoReader.First(okf, 2).Value.Text;
                 ProtoField? ex = ProtoReader.First(okf, 4);
                 int secs = ex == null ? 3600 : (int)ex.Value.Int;
-                _tokenExpires = DateTime.UtcNow.AddSeconds(Math.Max(60, secs - 120));
+                lock (_lock) { _token = token; _tokenExpires = DateTime.UtcNow.AddSeconds(Math.Max(60, secs - 120)); }
                 Log.Write("Got access token (valid " + secs + "s)");
-                return _token;
+                LoadTimer.Note("token renewed in " + (int)LoadTimer.Ms(renew) + " ms");
+                ScheduleRenewal(secs);
+                return token;
             }
+        }
+
+        // The next token is fetched in the background 5 minutes before this one runs out, so no page ever waits for a
+        // renewal (pages keep using the current token meanwhile).
+        void ScheduleRenewal(int secs)
+        {
+            long due = Math.Max(30, secs - 300) * 1000L;
+            System.Threading.Timer old = _renewTimer;
+            _renewTimer = new System.Threading.Timer(delegate
+            {
+                try { lock (_renewLock) Renew(); }
+                catch (Exception e) { Log.Write("Background token renewal failed: " + e.Message); }
+            }, null, due, System.Threading.Timeout.Infinite);
+            if (old != null) old.Dispose();
+        }
+
+        // the main session isn't needed for pages, but playback will want it: started now, off the page's path
+        void ConnectInBackground()
+        {
+            ApSession s = _engine.Session;
+            if (s != null && s.Connected) return;
+            System.Threading.ThreadPool.QueueUserWorkItem(delegate
+            {
+                try { _engine.EnsureConnected(); }
+                catch (Exception e) { Log.Write("Connecting the session in the background failed: " + e.Message); }
+            });
         }
 
         byte[] Login5(byte[] loginContext, ProtoWriter solutions, ProtoWriter stored)
@@ -145,6 +325,10 @@ namespace Spotipaq.Engine
             lock (_lock)
             {
                 if (_base != null) return _base;
+                // the server last time, without asking (a page would wait for the answer); asked again if it fails
+                string known = Remembered.Get("spclient", TimeSpan.FromDays(3));
+                if (known != null) { _base = "https://" + known; _baseRemembered = true; return _base; }
+                long t = LoadTimer.Now;
                 string host = "spclient.wg.spotify.com:443";
                 try
                 {
@@ -152,19 +336,31 @@ namespace Spotipaq.Engine
                     if (r.Ok)
                     {
                         JArray a = (JArray)JObject.Parse(r.Text)["spclient"];
-                        if (a != null && a.Count > 0) host = (string)a[0];
+                        if (a != null && a.Count > 0) { host = (string)a[0]; Remembered.Set("spclient", host); }
                     }
                 }
                 catch (Exception ex) { Log.Write("spclient resolve failed: " + ex.Message); }
                 _base = "https://" + host;
+                LoadTimer.Add("server lookup", t);
                 return _base;
             }
         }
 
         string AuthHeaders(bool json)
         {
-            return "Authorization: Bearer " + Token() + "\r\nclient-token: " + ClientToken() + "\r\n" +
+            long t = LoadTimer.Now;                     // includes waiting for another thread's renewal
+            string h = "Authorization: Bearer " + Token() + "\r\nclient-token: " + ClientToken() + "\r\n" +
                 (json ? "Accept: application/json\r\n" : "");
+            LoadTimer.Add("token", t);
+            return h;
+        }
+
+        // the log's name for a spclient request (LoadTimer)
+        static string Part(string path)
+        {
+            if (path.StartsWith("/playlist/", StringComparison.Ordinal)) return "playlist";
+            if (path.StartsWith("/extended-metadata/", StringComparison.Ordinal)) return "details";
+            return "spclient";
         }
 
         // ---- calls ----
@@ -175,9 +371,31 @@ namespace Spotipaq.Engine
             for (int attempt = 0; ; attempt++)
             {
                 string h = AuthHeaders(false) + (contentType != null ? "Content-Type: " + contentType + "\r\n" : "");
-                HttpResult r = Native.Http(method, SpBase() + path, h, body);
+                string url = SpBase() + path;
+                long t = LoadTimer.Now;
+                HttpResult r;
+                try { r = Native.Http(method, url, h, body); }
+                catch (IOException)
+                {
+                    // can't reach the server remembered from last time: ask which one to use, and try that
+                    if (!ForgetRememberedServer()) throw;
+                    continue;
+                }
+                LoadTimer.Add(Part(path), t);
                 if (r.Status == 401 && attempt == 0) { lock (_lock) { _token = null; _clientToken = null; } continue; }
                 return r;
+            }
+        }
+
+        bool ForgetRememberedServer()
+        {
+            lock (_lock)
+            {
+                if (!_baseRemembered) return false;
+                Log.Write("Remembered spclient server unreachable; asking again");
+                _base = null; _baseRemembered = false;
+                Remembered.Forget("spclient");
+                return true;
             }
         }
 
@@ -186,8 +404,12 @@ namespace Spotipaq.Engine
         {
             for (int attempt = 0; ; attempt++)
             {
+                long tt = LoadTimer.Now;
                 string h = "Authorization: Bearer " + Token() + "\r\nAccept: application/json\r\n";
+                LoadTimer.Add("token", tt);
+                long t = LoadTimer.Now;
                 HttpResult r = Native.Http(method, "https://api.spotify.com/v1" + pathAndQuery, h, method == "GET" ? null : new byte[0]);
+                LoadTimer.Add("web api", t);
                 if (r.Status == 401 && attempt == 0) { lock (_lock) { _token = null; } continue; }
                 return r;
             }
@@ -205,7 +427,9 @@ namespace Spotipaq.Engine
             for (int attempt = 0; ; attempt++)
             {
                 string h = AuthHeaders(true) + "Content-Type: application/json;charset=UTF-8\r\napp-platform: Win32\r\nAccept-Language: en\r\n";
+                long t = LoadTimer.Now;
                 HttpResult r = Native.Http("POST", "https://api-partner.spotify.com/pathfinder/v2/query", h, bytes);
+                LoadTimer.Add("pathfinder", t);
                 if (r.Status == 401 && attempt == 0) { lock (_lock) { _token = null; _clientToken = null; } continue; }
                 if (!r.Ok) throw new InvalidOperationException(operation + " failed (HTTP " + r.Status + ")");
                 JObject root = JObject.Parse(r.Text);
@@ -243,6 +467,7 @@ namespace Spotipaq.Engine
                     req.Message(2, new ProtoWriter().String(1, uris[i]).Message(2, new ProtoWriter().Int(1, kind)));
                 HttpResult r = Sp("POST", "/extended-metadata/v0/extended-metadata", req.ToArray(), "application/x-protobuf");
                 if (!r.Ok) throw new InvalidOperationException("Metadata request failed (HTTP " + r.Status + ")");
+                long parse = LoadTimer.Now;
                 foreach (ProtoField arr in new ProtoReader(r.Body).ReadAll().ContainsKey(2) ? new ProtoReader(r.Body).ReadAll()[2] : new List<ProtoField>())
                 {
                     Dictionary<int, List<ProtoField>> a = arr.Message.ReadAll();
@@ -262,6 +487,7 @@ namespace Spotipaq.Engine
                         if (val != null) result[uri.Value.Text] = val.Value.Data;
                     }
                 }
+                LoadTimer.Add("details parse", parse);
             }
             return result;
         }

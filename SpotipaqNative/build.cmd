@@ -1,6 +1,7 @@
 @echo off
 setlocal EnableExtensions DisableDelayedExpansion
-rem SpotipaqNative.dll - XP / Pentium II helper: https via OpenSSL 1.0.2u, big-number maths, Vorbis decoding + waveOut.
+rem SpotipaqNative.dll - XP / Pentium II helper: https via OpenSSL 1.0.2u, big-number maths, Vorbis decoding + waveOut,
+rem scaled JPEG decoding (artwork) and the header banner.
 rem Same proven toolchain as NativePlayer: VS2017 14.16 x86, /arch:IA32 /MT, subsystem 5.01.
 rem   build.cmd          build and copy to ..\Spotipaq\native
 rem   build.cmd clean    delete build output
@@ -33,7 +34,7 @@ if not defined OSSL (
 echo SpotipaqNative: OpenSSL = "%OSSL%"
 
 rem ---- up to date? (only recompile when a source file or this script changed) ----
-set "SRCS=spqnative.c spq_audio.c spq_vorbis.c spq_vorbis.h spq_vorbis_db.inc build.cmd"
+set "SRCS=spqnative.c spq_audio.c spq_vorbis.c spq_vorbis.h spq_vorbis_db.inc spq_jpeg.c build.cmd"
 set "NEED=1"
 if exist "%OBJ%\SpotipaqNative.dll" if exist "%DEST%\SpotipaqNative.dll" if exist "%OBJ%\stamp\build.cmd" (
   set "NEED=0"
@@ -56,7 +57,7 @@ if not exist "%OBJ%" mkdir "%OBJ%"
 if not exist "%DEST%" mkdir "%DEST%"
 
 "%VS_BIN%\cl.exe" /nologo /LD /O2 /MT /arch:IA32 /W3 /DWINVER=0x0501 /D_WIN32_WINNT=0x0501 /D_CRT_SECURE_NO_WARNINGS ^
-  /I"%OSSL%\include" /Fo"%OBJ%\\" "%ROOT%spqnative.c" "%ROOT%spq_audio.c" "%ROOT%spq_vorbis.c" ^
+  /I"%OSSL%\include" /Fo"%OBJ%\\" "%ROOT%spqnative.c" "%ROOT%spq_audio.c" "%ROOT%spq_vorbis.c" "%ROOT%spq_jpeg.c" ^
   /link /NOLOGO /MACHINE:X86 /SUBSYSTEM:WINDOWS,5.01 /OUT:"%OBJ%\SpotipaqNative.dll" /IMPLIB:"%OBJ%\SpotipaqNative.lib" ^
   /LIBPATH:"%OSSL%\lib" ssl.lib crypto.lib ws2_32.lib gdi32.lib advapi32.lib user32.lib crypt32.lib winmm.lib
 if errorlevel 1 (echo SpotipaqNative : error : compile/link failed.& exit /b 1)
@@ -64,7 +65,7 @@ if errorlevel 1 (echo SpotipaqNative : error : compile/link failed.& exit /b 1)
 rem No SSE in OUR code: the Pentium II would crash with an illegal instruction. (The whole DLL can't be
 rem checked: the static VS2017 C runtime contains SSE2 memcpy/strlen variants, but it only uses them after
 rem checking the CPU, so they never run on the Compaq. OpenSSL was checked when it was built with no-asm.)
-for %%O in (spqnative spq_audio spq_vorbis) do (
+for %%O in (spqnative spq_audio spq_vorbis spq_jpeg) do (
   "%VS_BIN%\dumpbin.exe" /DISASM "%OBJ%\%%O.obj" | findstr /i /c:"xmm" >nul
   if not errorlevel 1 (echo SpotipaqNative : error : SSE instructions found in %%O.obj.& exit /b 1)
 )

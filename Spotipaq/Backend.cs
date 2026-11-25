@@ -15,8 +15,10 @@ namespace Spotipaq
     {
         UserInfo GetUser();
         List<Playlist> GetPlaylists();              // sidebar rootlist (tracks may be empty)
+        List<Playlist> GetCachedPlaylists();        // the sidebar list as it was last fetched, without asking Spotify; null if none
         List<BrowseSection> GetBrowse();
         Playlist GetPlaylist(string id);
+        Playlist GetCachedPlaylist(string id);      // as saved last time it was opened, without asking Spotify; null if none
         Album GetAlbum(string id);
         ArtistPage GetArtist(string id);
         SearchResults Search(string query);
