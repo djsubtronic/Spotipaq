@@ -208,10 +208,14 @@ namespace Spotipaq
         // page's title beside back / forward (as on Spotify)
         const int StickyD = 32;
         Rectangle StickyPlayRect { get { return new Rectangle(ForwardRect.Right + 10, (HeaderH - StickyD) / 2, StickyD, StickyD); } }
+        // On a page with "Search in playlist" the two arrive together: the title waits until the box docks in the
+        // bar (the box sits lower than the play button, so it always gets there second).
         Block Sticky()
         {
+            bool waitForBox = SearchShown && SearchRect.Top >= HeaderH;      // the box is still down in its own row
             foreach (Block b in _blocks)
-                if (b.StickyTitle != null && b.StickyButton != null && _scroll >= b.Top + b.StickyFrom - HeaderH) return b;
+                if (b.StickyTitle != null && b.StickyButton != null && _scroll >= b.Top + b.StickyFrom - HeaderH)
+                    return waitForBox ? null : b;
             return null;
         }
 
